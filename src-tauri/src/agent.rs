@@ -16,6 +16,7 @@ Update the previous summary with the newly compressed user+assistant turns.
 Preserve only context needed to continue the conversation: user goals, decisions, constraints, unresolved questions, important assistant outputs, project details, and facts referenced later.
 Do not copy the transcript verbatim. Do not invent facts. Keep it dense and concise.
 Output only the updated summary as plain text.";
+const DEFAULT_VALIDATOR_INVARIANTS: &str = "forbid: RxJava\nforbid: AsyncTask";
 const MEMORY_ROUTER_INSTRUCTIONS: &str = "You are a memory-router after one assistant turn. Extract only NEW useful memory from the user's latest message AND the assistant's answer.
 
 Output 1 row per independent memory item, no fixed row count, no markdown, no extra text, no pipe chars inside fields:
@@ -88,6 +89,8 @@ pub struct AgentRequest {
     pub memory_context: MemoryContext,
     #[serde(default)]
     pub short_term_compression: ShortTermCompressionSettings,
+    #[serde(default)]
+    pub orchestration: OrchestrationSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +102,7 @@ pub struct AgentReply {
     pub short_term_summary: Option<ShortTermSummary>,
     pub debug: MemoryDebugInfo,
     pub memory_decisions: Vec<MemoryDecision>,
+    pub task_state: Option<TaskState>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +122,8 @@ pub struct MemoryContext {
     pub short_term_summary: Option<ShortTermSummary>,
     pub working: Vec<MemoryItem>,
     pub long_term: Vec<MemoryItem>,
+    #[serde(default)]
+    pub task_state: Option<TaskState>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +134,63 @@ pub struct UserProfile {
     pub format: String,
     pub constraints: String,
     pub context: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskState {
+    pub phase: String,
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub step: usize,
+    #[serde(default = "default_task_total_steps")]
+    pub total_steps: usize,
+    #[serde(default)]
+    pub draft_plan: String,
+    #[serde(default)]
+    pub approved_plan: String,
+    #[serde(default)]
+    pub solution: String,
+    #[serde(default)]
+    pub validation_report: String,
+    #[serde(default)]
+    pub violations: Vec<String>,
+    #[serde(default)]
+    pub done: Vec<String>,
+    pub current_step: String,
+    pub expected_action: String,
+    pub is_paused: bool,
+    pub updated_at: String,
+}
+
+fn default_task_total_steps() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default = "default_validator_invariants")]
+    pub validator_invariants: String,
+}
+
+impl Default for OrchestrationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: None,
+            validator_invariants: default_validator_invariants(),
+        }
+    }
+}
+
+fn default_validator_invariants() -> String {
+    DEFAULT_VALIDATOR_INVARIANTS.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +258,14 @@ pub struct MemoryDebugInfo {
     pub prompt_preview: String,
     pub memory_router_input: String,
     pub memory_router_raw: String,
+    pub task_phase: Option<String>,
+    pub task_current_step: String,
+    pub task_expected_action: String,
+    pub task_paused: bool,
+    pub orchestrator_enabled: bool,
+    pub orchestrator_agent: String,
+    pub orchestrator_action: String,
+    pub validator_violations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +283,7 @@ pub struct Agent {
     system_prompt: String,
     memory_context: MemoryContext,
     short_term_compression: ShortTermCompressionSettings,
+    orchestration: OrchestrationSettings,
     client: reqwest::Client,
 }
 
@@ -237,6 +309,7 @@ impl Agent {
             system_prompt: request.system_prompt.trim().to_owned(),
             memory_context: request.memory_context.clone(),
             short_term_compression: request.short_term_compression.clone(),
+            orchestration: request.orchestration.clone(),
             client: reqwest::Client::new(),
         })
     }
@@ -253,6 +326,12 @@ impl Agent {
     {
         if messages.is_empty() {
             return Err(AgentError::EmptyMessages);
+        }
+
+        if self.orchestration.enabled {
+            return self
+                .send_orchestrated(messages, on_delta, on_memory_started)
+                .await;
         }
 
         let latest_user_message = messages
@@ -390,7 +469,286 @@ impl Agent {
             short_term_summary: short_term_preparation.summary,
             debug,
             memory_decisions: memory_router_result.decisions,
+            task_state: None,
         })
+    }
+
+    async fn send_orchestrated<F, G>(
+        &self,
+        messages: Vec<ChatMessage>,
+        mut on_delta: F,
+        mut on_memory_started: G,
+    ) -> Result<AgentReply, AgentError>
+    where
+        F: FnMut(&str),
+        G: FnMut(),
+    {
+        let latest_user_message = messages
+            .iter()
+            .rev()
+            .find(|message| normalize_role(&message.role) == "user")
+            .map(|message| message.content.trim().to_owned())
+            .unwrap_or_default();
+        let short_term_preparation = self.prepare_short_term_messages(&messages).await;
+        let mut effective_memory_context = self.memory_context.clone();
+        effective_memory_context.short_term = short_term_preparation.messages.clone();
+        effective_memory_context.short_term_summary = short_term_preparation.summary.clone();
+        let memory_instruction = build_memory_instruction(&effective_memory_context);
+        let input_message_count = short_term_preparation
+            .messages
+            .iter()
+            .filter(|message| !message.content.trim().is_empty())
+            .count();
+        let action = normalize_orchestrator_action(self.orchestration.action.as_deref());
+        let mut task_state = normalize_task_state(effective_memory_context.task_state.clone());
+        let active_agent: String;
+        let mut validator_violations = Vec::new();
+
+        let content = match (task_state.phase.as_str(), action.as_str()) {
+            ("done", "userMessage") => {
+                task_state = normalize_task_state(None);
+                task_state.task = latest_user_message.clone();
+                active_agent = "PLANNING".to_owned();
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_planning_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                )
+                .await?
+            }
+            ("done", _) => {
+                task_state.current_step = "Задача завершена.".to_owned();
+                task_state.expected_action =
+                    "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+                active_agent = "DONE".to_owned();
+                "✅ Задача уже завершена. Ее нельзя оспорить или вернуть на предыдущий этап. Напишите новый запрос, чтобы начать новую задачу.".to_owned()
+            }
+            ("planning", "approvePlan") => {
+                task_state = transition_task_state(task_state, "execution")?;
+                task_state.approved_plan = if task_state.draft_plan.trim().is_empty() {
+                    task_state.approved_plan
+                } else {
+                    task_state.draft_plan.clone()
+                };
+                active_agent = "EXECUTION".to_owned();
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_execution_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                    None,
+                )
+                .await?
+            }
+            ("execution", "disputeSolution") => {
+                task_state = transition_task_state(task_state, "planning")?;
+                task_state.current_step =
+                    "Пересобрать план с учетом замечаний пользователя.".to_owned();
+                task_state.expected_action =
+                    "Пользователь вносит правки, Planning Agent обновляет план.".to_owned();
+                active_agent = "PLANNING".to_owned();
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_planning_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                )
+                .await?
+            }
+            ("validation", "disputeSolution") => {
+                task_state = transition_task_state(task_state, "execution")?;
+                active_agent = "EXECUTION".to_owned();
+                let dispute_violations = vec![
+                    "Пользователь оспорил решение на этапе validation. Доработай решение без возврата в planning.".to_owned(),
+                ];
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_execution_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                    Some(&dispute_violations),
+                )
+                .await?
+            }
+            ("execution", "approveSolution") | ("validation", _) => {
+                task_state = transition_task_state(task_state, "validation")?;
+                let validation_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let validation = run_validation_agent(
+                    self,
+                    &latest_user_message,
+                    &validation_memory_instruction,
+                    &mut task_state,
+                )
+                .await?;
+                validator_violations = validation.violations.clone();
+
+                if validation.violations.is_empty() {
+                    task_state = transition_task_state(task_state, "done")?;
+                    task_state.validation_report = validation.report.clone();
+                    task_state.done = vec![
+                        "План утвержден".to_owned(),
+                        "Решение подготовлено".to_owned(),
+                        "Валидация пройдена".to_owned(),
+                    ];
+                    task_state.current_step = "Задача завершена.".to_owned();
+                    task_state.expected_action =
+                        "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+                    task_state.violations.clear();
+                    active_agent = "DONE".to_owned();
+                    run_done_agent(self, &memory_instruction, &task_state).await?
+                } else {
+                    task_state.validation_report = validation.report.clone();
+                    task_state.violations = validation.violations.clone();
+                    task_state = transition_task_state(task_state, "execution")?;
+                    active_agent = "EXECUTION".to_owned();
+                    let correction_feedback = format!(
+                        "Validation failed. Fix the solution using these violations:\n{}",
+                        validation.violations.join("\n")
+                    );
+                    let stage_memory_instruction = build_memory_instruction_for_task_state(
+                        &effective_memory_context,
+                        &task_state,
+                    );
+                    let corrected = run_execution_agent(
+                        self,
+                        &correction_feedback,
+                        &stage_memory_instruction,
+                        &mut task_state,
+                        Some(&validation.violations),
+                    )
+                    .await?;
+
+                    format!(
+                        "⚠️ Валидация не прошла, оркестратор вернул задачу в execution.\n\nНарушения:\n{}\n\nExecution Agent подготовил исправленное решение:\n{}",
+                        validation.violations.join("\n"),
+                        corrected
+                    )
+                }
+            }
+            ("execution", _) => {
+                active_agent = "EXECUTION".to_owned();
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_execution_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                    None,
+                )
+                .await?
+            }
+            _ => {
+                active_agent = "PLANNING".to_owned();
+                let stage_memory_instruction =
+                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                run_planning_agent(
+                    self,
+                    &latest_user_message,
+                    &stage_memory_instruction,
+                    &mut task_state,
+                )
+                .await?
+            }
+        };
+
+        if content.trim().is_empty() {
+            return Err(AgentError::EmptyResponse);
+        }
+
+        on_delta(&content);
+
+        let mut effective_memory_context = effective_memory_context;
+        effective_memory_context.task_state = Some(task_state.clone());
+        let mut debug = build_memory_debug(&effective_memory_context, input_message_count, "");
+        debug.input_message_count = input_message_count;
+        debug.memory_instruction_chars = memory_instruction.chars().count();
+        debug.prompt_preview = preview_text(&memory_instruction, 1200);
+        debug.short_term_visible_message_count = messages.len();
+        debug.short_term_input_message_count = input_message_count;
+        debug.short_term_summary_chars = short_term_preparation
+            .summary
+            .as_ref()
+            .map(|summary| summary.content.chars().count())
+            .unwrap_or_default();
+        debug.short_term_compressed_turn_count = short_term_preparation
+            .summary
+            .as_ref()
+            .map(|summary| summary.compressed_turn_count)
+            .unwrap_or_default();
+        debug.short_term_compression_enabled = short_term_preparation.debug.enabled;
+        debug.short_term_compression_limit = short_term_preparation.debug.limit;
+        debug.short_term_compression_triggered = short_term_preparation.debug.triggered;
+        debug.short_term_compression_input =
+            preview_text(&short_term_preparation.debug.raw_input, 3000);
+        debug.short_term_compression_raw =
+            preview_text(&short_term_preparation.debug.raw_output, 3000);
+        debug.orchestrator_enabled = true;
+        debug.orchestrator_agent = active_agent;
+        debug.orchestrator_action = action;
+        debug.validator_violations = validator_violations;
+
+        on_memory_started();
+        let memory_router_result = self.classify_memory(&latest_user_message, &content).await;
+        debug.memory_router_input = preview_text(&memory_router_result.raw_input, 4000);
+        debug.memory_router_raw = preview_text(&memory_router_result.raw_output, 4000);
+
+        Ok(AgentReply {
+            content,
+            model: self.model.clone(),
+            usage: None,
+            short_term_summary: short_term_preparation.summary,
+            debug,
+            memory_decisions: memory_router_result.decisions,
+            task_state: Some(task_state),
+        })
+    }
+
+    async fn request_text(&self, instructions: &str, input: &str) -> Result<String, AgentError> {
+        let body = json!({
+            "model": self.model,
+            "instructions": instructions,
+            "input": input,
+            "max_output_tokens": 1600
+        });
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
+
+        if !status.is_success() {
+            return Err(AgentError::RequestFailed(format_openai_error(
+                status.as_u16(),
+                &response_text,
+            )));
+        }
+
+        let parsed = serde_json::from_str::<OpenAIResponse>(&response_text)
+            .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
+
+        parsed.extract_text().ok_or(AgentError::EmptyResponse)
     }
 
     async fn prepare_short_term_messages(&self, messages: &[ChatMessage]) -> ShortTermPreparation {
@@ -640,6 +998,319 @@ impl MemoryRouterResult {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ValidationResult {
+    report: String,
+    violations: Vec<String>,
+}
+
+async fn run_planning_agent(
+    agent: &Agent,
+    user_message: &str,
+    memory_instruction: &str,
+    task_state: &mut TaskState,
+) -> Result<String, AgentError> {
+    if task_state.task.trim().is_empty() {
+        task_state.task = preview_text(user_message, 260);
+    }
+
+    let instructions = combine_instructions(
+        &agent.system_prompt,
+        &format!(
+            "{memory_instruction}\n\n\
+             Stage agent role: PLANNING.\n\
+             You are the Planning Agent. Your only job is to clarify the user task and produce or update an implementation plan.\n\
+             Do not solve the task. Do not write final code or final implementation. Ask focused questions only if the task is truly underspecified.\n\
+             Output a clear plan the user can approve or edit. Include assumptions and constraints you used."
+        ),
+    );
+    let input = format!(
+        "orchestrator_state: planning\n\
+         user_message:\n{}\n\n\
+         current_task:\n{}\n\n\
+         previous_draft_plan:\n{}\n\n\
+         approved_plan:\n{}",
+        preview_text(user_message, 2000),
+        preview_text(&task_state.task, 800),
+        preview_text(&task_state.draft_plan, 5000),
+        preview_text(&task_state.approved_plan, 5000)
+    );
+    let response = agent.request_text(&instructions, &input).await?;
+
+    task_state.phase = "planning".to_owned();
+    task_state.step = 0;
+    task_state.total_steps = 4;
+    task_state.draft_plan = response.clone();
+    task_state.current_step = "Согласовать план решения с пользователем.".to_owned();
+    task_state.expected_action =
+        "Пользователь может одобрить план кнопкой или написать правки в чат.".to_owned();
+    task_state.updated_at = String::new();
+    task_state.violations.clear();
+
+    Ok(response)
+}
+
+async fn run_execution_agent(
+    agent: &Agent,
+    user_message: &str,
+    memory_instruction: &str,
+    task_state: &mut TaskState,
+    validation_violations: Option<&[String]>,
+) -> Result<String, AgentError> {
+    if task_state.approved_plan.trim().is_empty() {
+        task_state.phase = "planning".to_owned();
+        task_state.current_step = "Сначала нужно утвердить план.".to_owned();
+        task_state.expected_action = "Одобрите план или внесите правки.".to_owned();
+        task_state.updated_at = String::new();
+        return Ok("Переход к execution запрещён: сначала нужно утвердить план.".to_owned());
+    }
+
+    let violations_text = validation_violations
+        .map(|items| items.join("\n"))
+        .unwrap_or_else(|| "none".to_owned());
+    let instructions = combine_instructions(
+        &agent.system_prompt,
+        &format!(
+             "{memory_instruction}\n\n\
+             Stage agent role: EXECUTION.\n\
+             You are the Execution Agent. Follow the approved plan exactly and produce the solution.\n\
+             Do not renegotiate the plan unless validation feedback requires a fix. Do not mark the task as done.\n\
+             If validation violations are provided, fix the solution according to them."
+        ),
+    );
+    let input = format!(
+        "orchestrator_state: execution\n\
+         user_message_or_feedback:\n{}\n\n\
+         approved_plan:\n{}\n\n\
+         previous_solution:\n{}\n\n\
+         validation_violations:\n{}",
+        preview_text(user_message, 2400),
+        preview_text(&task_state.approved_plan, 7000),
+        preview_text(&task_state.solution, 7000),
+        preview_text(&violations_text, 3000)
+    );
+    let response = agent.request_text(&instructions, &input).await?;
+
+    task_state.phase = "execution".to_owned();
+    task_state.step = 1;
+    task_state.total_steps = 4;
+    task_state.solution = response.clone();
+    task_state.current_step =
+        "Проверить решение и решить, отправлять ли его на валидацию.".to_owned();
+    task_state.expected_action =
+        "Пользователь может отправить решение на валидацию или оспорить его.".to_owned();
+    task_state.updated_at = String::new();
+    task_state.validation_report.clear();
+    task_state.violations.clear();
+
+    Ok(response)
+}
+
+async fn run_validation_agent(
+    agent: &Agent,
+    user_message: &str,
+    memory_instruction: &str,
+    task_state: &mut TaskState,
+) -> Result<ValidationResult, AgentError> {
+    let code_violations = check_validator_invariants(
+        &task_state.solution,
+        &agent.orchestration.validator_invariants,
+    );
+    let code_status = if code_violations.is_empty() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let instructions = combine_instructions(
+        &agent.system_prompt,
+        &format!(
+             "{memory_instruction}\n\n\
+             Stage agent role: VALIDATION.\n\
+             You are the Validation Agent. Check whether the solution follows the approved plan and invariants.\n\
+             Do not write a new solution. Produce a concise validation report.\n\
+             The deterministic code checker result is authoritative."
+        ),
+    );
+    let input = format!(
+        "orchestrator_state: validation\n\
+         user_message:\n{}\n\n\
+         approved_plan:\n{}\n\n\
+         solution_to_validate:\n{}\n\n\
+         validator_invariants:\n{}\n\n\
+         deterministic_code_check: {}\n\
+         code_violations:\n{}",
+        preview_text(user_message, 1600),
+        preview_text(&task_state.approved_plan, 7000),
+        preview_text(&task_state.solution, 9000),
+        preview_text(&agent.orchestration.validator_invariants, 3000),
+        code_status,
+        if code_violations.is_empty() {
+            "none".to_owned()
+        } else {
+            code_violations.join("\n")
+        }
+    );
+    let report = agent.request_text(&instructions, &input).await?;
+
+    task_state.phase = "validation".to_owned();
+    task_state.step = 2;
+    task_state.total_steps = 4;
+    task_state.validation_report = report.clone();
+    task_state.violations = code_violations.clone();
+    task_state.current_step = "Проверить решение по инвариантам.".to_owned();
+    task_state.expected_action = if code_violations.is_empty() {
+        "Валидация прошла, оркестратор может перейти в done.".to_owned()
+    } else {
+        "Валидация не прошла, оркестратор возвращает задачу в execution.".to_owned()
+    };
+    task_state.updated_at = String::new();
+
+    Ok(ValidationResult {
+        report,
+        violations: code_violations,
+    })
+}
+
+async fn run_done_agent(
+    _agent: &Agent,
+    _memory_instruction: &str,
+    task_state: &TaskState,
+) -> Result<String, AgentError> {
+    let final_solution = task_state.solution.trim();
+
+    if final_solution.is_empty() {
+        return Err(AgentError::EmptyResponse);
+    }
+
+    Ok(format!(
+        "✅ Валидация пройдена. Финальное решение:\n\n{final_solution}"
+    ))
+}
+
+fn normalize_orchestrator_action(action: Option<&str>) -> String {
+    match action.unwrap_or("userMessage") {
+        "approvePlan" => "approvePlan",
+        "approveSolution" => "approveSolution",
+        "disputeSolution" => "disputeSolution",
+        "debugTransition" => "debugTransition",
+        _ => "userMessage",
+    }
+    .to_owned()
+}
+
+fn normalize_task_state(task_state: Option<TaskState>) -> TaskState {
+    let mut state = task_state.unwrap_or_else(|| TaskState {
+        phase: "planning".to_owned(),
+        task: String::new(),
+        step: 0,
+        total_steps: 4,
+        draft_plan: String::new(),
+        approved_plan: String::new(),
+        solution: String::new(),
+        validation_report: String::new(),
+        violations: Vec::new(),
+        done: Vec::new(),
+        current_step: "Сформировать план задачи".to_owned(),
+        expected_action: "Опишите цель или подтвердите план переходом к execution.".to_owned(),
+        is_paused: false,
+        updated_at: String::new(),
+    });
+
+    if !matches!(
+        state.phase.as_str(),
+        "planning" | "execution" | "validation" | "done"
+    ) {
+        state.phase = "planning".to_owned();
+    }
+
+    state.step = match state.phase.as_str() {
+        "planning" => 0,
+        "execution" => 1,
+        "validation" => 2,
+        "done" => 3,
+        _ => 0,
+    };
+    state.total_steps = 4;
+    if state.phase == "done" {
+        state.current_step = "Задача завершена.".to_owned();
+        state.expected_action = "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+    }
+    state
+}
+
+fn transition_task_state(mut state: TaskState, target: &str) -> Result<TaskState, AgentError> {
+    let allowed = match state.phase.as_str() {
+        "planning" => matches!(target, "execution"),
+        "execution" => matches!(target, "planning" | "validation"),
+        "validation" => matches!(target, "execution" | "done"),
+        "done" => false,
+        _ => false,
+    };
+
+    if !allowed && state.phase != target {
+        return Err(AgentError::RequestFailed(format!(
+            "Transition {} -> {} is forbidden.",
+            state.phase, target
+        )));
+    }
+
+    state.phase = target.to_owned();
+    state.step = match target {
+        "planning" => 0,
+        "execution" => 1,
+        "validation" => 2,
+        "done" => 3,
+        _ => 0,
+    };
+    state.total_steps = 4;
+    state.updated_at = String::new();
+    Ok(state)
+}
+
+fn check_validator_invariants(response: &str, invariants: &str) -> Vec<String> {
+    let response_normalized = response.to_lowercase();
+    let mut violations = Vec::new();
+
+    for line in invariants.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some(value) = invariant_value(trimmed, &["must:", "required:", "обязательно:"])
+        {
+            let expected = value.trim();
+            if !expected.is_empty() && !response_normalized.contains(&expected.to_lowercase()) {
+                violations.push(format!("must not satisfied: {expected}"));
+            }
+            continue;
+        }
+
+        if let Some(value) = invariant_value(trimmed, &["forbid:", "no:", "ban:", "запрет:"])
+        {
+            let forbidden = value.trim();
+            if forbidden.is_empty() {
+                continue;
+            }
+
+            if response_normalized.contains(&forbidden.to_lowercase()) {
+                violations.push(format!("forbidden content found: {forbidden}"));
+            }
+        }
+    }
+
+    violations
+}
+
+fn invariant_value<'a>(line: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    let normalized = line.to_lowercase();
+    prefixes.iter().find_map(|prefix| {
+        normalized
+            .strip_prefix(prefix)
+            .map(|_| &line[prefix.len()..])
+    })
+}
+
 fn default_memory_decisions(reason: &str) -> Vec<MemoryDecision> {
     vec![
         MemoryDecision {
@@ -823,9 +1494,10 @@ fn build_memory_router_input(
     memory: &MemoryContext,
 ) -> String {
     format!(
-        "user:\n{}\n\nassistant:\n{}\n\nactive_profile:\n{}\n\nexisting_working:\n{}\n\nexisting_longTerm:\n{}",
+        "user:\n{}\n\nassistant:\n{}\n\ntask_state:\n{}\n\nactive_profile:\n{}\n\nexisting_working:\n{}\n\nexisting_longTerm:\n{}",
         preview_text(user_message, 1600),
         preview_text(assistant_reply, 8000),
+        format_task_state(memory.task_state.as_ref()),
         format_user_profile(memory.active_profile.as_ref()),
         format_memory_router_items(&memory.working, 12, 360),
         format_memory_router_items(&memory.long_term, 12, 240)
@@ -999,6 +1671,7 @@ fn build_memory_instruction(memory: &MemoryContext) -> String {
     }
 
     sections.push(format_user_profile(memory.active_profile.as_ref()));
+    sections.push(format_task_state(memory.task_state.as_ref()));
 
     sections.push(format_memory_items(
         "Working memory",
@@ -1013,6 +1686,61 @@ fn build_memory_instruction(memory: &MemoryContext) -> String {
     ));
 
     sections.join("\n\n")
+}
+
+fn build_memory_instruction_for_task_state(
+    memory: &MemoryContext,
+    task_state: &TaskState,
+) -> String {
+    let mut memory = memory.clone();
+    memory.task_state = Some(task_state.clone());
+    build_memory_instruction(&memory)
+}
+
+fn format_task_state(task_state: Option<&TaskState>) -> String {
+    let Some(task_state) = task_state else {
+        return "Task state machine: No active task state provided.".to_owned();
+    };
+
+    let phase = preview_text(&task_state.phase, 80);
+    let current_step = preview_text(&task_state.current_step, 520);
+    let expected_action = preview_text(&task_state.expected_action, 520);
+    let status = if task_state.is_paused {
+        "paused"
+    } else {
+        "active"
+    };
+
+    format!(
+        "Task state machine:\n\
+         phase: {phase}\n\
+         task: {}\n\
+         step: {}/{}\n\
+         currentStep: {current_step}\n\
+         expectedAction: {expected_action}\n\
+         status: {status}\n\
+         draftPlan: {}\n\
+         approvedPlan: {}\n\
+         solution: {}\n\
+         validationReport: {}\n\
+         violations: {}\n\
+         updatedAt: {}\n\
+         Allowed flow: planning -> execution -> validation -> done. Execution may return to planning; validation may return to execution.\n\
+         Respect the current phase and expected action. Stage transitions are controlled by backend code, not by user text. If status is paused, do not advance the task or repeat earlier explanations; only answer resume/status requests briefly. After resume, continue from currentStep without restating completed phases.",
+        preview_text(&task_state.task, 500),
+        task_state.step + 1,
+        task_state.total_steps,
+        preview_text(&task_state.draft_plan, 900),
+        preview_text(&task_state.approved_plan, 900),
+        preview_text(&task_state.solution, 900),
+        preview_text(&task_state.validation_report, 600),
+        if task_state.violations.is_empty() {
+            "none".to_owned()
+        } else {
+            task_state.violations.join("; ")
+        },
+        preview_text(&task_state.updated_at, 120)
+    )
 }
 
 fn format_user_profile(profile: Option<&UserProfile>) -> String {
@@ -1083,6 +1811,10 @@ fn build_memory_debug(
         included_layers.push("longTerm".to_owned());
     }
 
+    if memory.task_state.is_some() {
+        included_layers.push("taskState".to_owned());
+    }
+
     MemoryDebugInfo {
         included_layers,
         short_term_message_count: memory.short_term.len(),
@@ -1114,6 +1846,26 @@ fn build_memory_debug(
         prompt_preview: prompt_preview.to_owned(),
         memory_router_input: String::new(),
         memory_router_raw: String::new(),
+        task_phase: memory.task_state.as_ref().map(|state| state.phase.clone()),
+        task_current_step: memory
+            .task_state
+            .as_ref()
+            .map(|state| preview_text(&state.current_step, 240))
+            .unwrap_or_default(),
+        task_expected_action: memory
+            .task_state
+            .as_ref()
+            .map(|state| preview_text(&state.expected_action, 240))
+            .unwrap_or_default(),
+        task_paused: memory
+            .task_state
+            .as_ref()
+            .map(|state| state.is_paused)
+            .unwrap_or_default(),
+        orchestrator_enabled: false,
+        orchestrator_agent: String::new(),
+        orchestrator_action: String::new(),
+        validator_violations: Vec::new(),
     }
 }
 
@@ -1300,6 +2052,22 @@ mod tests {
                 source_message: None,
             }],
             long_term: Vec::new(),
+            task_state: Some(TaskState {
+                phase: "execution".to_owned(),
+                task: "Android-приложение".to_owned(),
+                step: 1,
+                total_steps: 4,
+                draft_plan: "Черновой план".to_owned(),
+                approved_plan: "Утвержденный план".to_owned(),
+                solution: String::new(),
+                validation_report: String::new(),
+                violations: Vec::new(),
+                done: Vec::new(),
+                current_step: "Собрать основной функционал".to_owned(),
+                expected_action: "Продолжить реализацию без повторения плана".to_owned(),
+                is_paused: false,
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            }),
         };
 
         let input = build_memory_router_input(
@@ -1310,6 +2078,8 @@ mod tests {
 
         assert!(input.contains("user:"));
         assert!(input.contains("assistant:"));
+        assert!(input.contains("task_state:"));
+        assert!(input.contains("phase: execution"));
         assert!(input.contains("active_profile:"));
         assert!(input.contains("existing_working:"));
         assert!(input.contains("Сформировал ТЗ"));
@@ -1330,6 +2100,7 @@ mod tests {
             short_term_summary: None,
             working: Vec::new(),
             long_term: Vec::new(),
+            task_state: None,
         };
 
         let instruction = build_memory_instruction(&memory);

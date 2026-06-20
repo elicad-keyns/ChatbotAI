@@ -10,8 +10,11 @@ import type {
   MemoryItem,
   MemoryLayerId,
   AgentStreamDelta,
+  OrchestratorAction,
   ShortTermCompressionSettings,
   ShortTermSummary,
+  TaskPhase,
+  TaskState,
   UserProfile
 } from "./types";
 
@@ -21,6 +24,7 @@ const DEFAULT_SYSTEM_PROMPT =
 const SETTINGS_STORAGE_KEY = "chatbot-ai.settings.v1";
 const CHATS_STORAGE_KEY = "chatbot-ai.chats.v1";
 const WORKING_MEMORY_STORAGE_KEY = "chatbot-ai.memory.working.v1";
+const TASK_STATE_STORAGE_KEY = "chatbot-ai.task-state.v1";
 const USER_PROFILES_STORAGE_KEY = "chatbot-ai.user-profiles.v1";
 const ACTIVE_PROFILE_STORAGE_KEY = "chatbot-ai.active-profile.v1";
 const FIRST_PROFILE_NAME = "Профиль 1";
@@ -31,6 +35,10 @@ const GENERATED_PROFILE_DEFAULTS = {
   constraints: "Не перегружать ответ лишней теорией. Учитывать русский язык интерфейса.",
   context: "Пользователь работает с desktop AI-agent и учебными задачами по stateful-агентам."
 };
+const DEFAULT_VALIDATOR_INVARIANTS = `# Кодовые проверки валидатора, по одной на строку
+# Форматы: must: текст, forbid: текст
+forbid: RxJava
+forbid: AsyncTask`;
 
 const ICONS = {
   ai: new URL("../src-tauri/new_icons/ai_100.png", import.meta.url).href,
@@ -91,6 +99,59 @@ const MEMORY_LAYER_LABELS: Record<
   }
 };
 
+const TASK_PHASES: { id: TaskPhase; label: string; description: string }[] = [
+  {
+    id: "planning",
+    label: "Planning",
+    description: "план"
+  },
+  {
+    id: "execution",
+    label: "Execution",
+    description: "работа"
+  },
+  {
+    id: "validation",
+    label: "Validation",
+    description: "проверка"
+  },
+  {
+    id: "done",
+    label: "Done",
+    description: "готово"
+  }
+];
+
+const TASK_PHASE_DEFAULTS: Record<
+  TaskPhase,
+  { currentStep: string; expectedAction: string }
+> = {
+  planning: {
+    currentStep: "Сформировать план задачи",
+    expectedAction: "Опишите цель или подтвердите план переходом к execution."
+  },
+  execution: {
+    currentStep: "Выполнить согласованный план",
+    expectedAction: "Дайте команду на реализацию или уточните рабочие ограничения."
+  },
+  validation: {
+    currentStep: "Проверить результат",
+    expectedAction: "Запустите проверку, ревью или укажите, что нужно исправить."
+  },
+  done: {
+    currentStep: "Задача завершена",
+    expectedAction: "Напишите новый запрос, чтобы начать новую задачу."
+  }
+};
+
+const TASK_PHASE_ORDER = TASK_PHASES.map((phase) => phase.id);
+const TASK_ALLOWED_TRANSITIONS: Record<TaskPhase, TaskPhase[]> = {
+  planning: ["execution"],
+  execution: ["planning", "validation"],
+  validation: ["execution", "done"],
+  done: []
+};
+
 type ThemeMode = "light" | "dark";
 type PersistentMemoryLayer = "working" | "longTerm";
 type MemoryAction = "saved" | "deleted" | "skipped";
@@ -104,6 +165,9 @@ interface AppSettings {
   autoScroll: boolean;
   shortTermCompressionEnabled: boolean;
   shortTermCompressionTurnLimit: number;
+  orchestrationEnabled: boolean;
+  validatorInvariants: string;
+  debugManualStateControls: boolean;
 }
 
 interface ChatSession {
@@ -147,7 +211,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   theme: "light",
   autoScroll: true,
   shortTermCompressionEnabled: true,
-  shortTermCompressionTurnLimit: 10
+  shortTermCompressionTurnLimit: 10,
+  orchestrationEnabled: false,
+  validatorInvariants: DEFAULT_VALIDATOR_INVARIANTS,
+  debugManualStateControls: false
 };
 
 function createEmptyChat(): ChatSession {
@@ -472,6 +539,169 @@ function shouldCompressShortTerm(
   return turnCount > settings.shortTermCompressionTurnLimit;
 }
 
+function createTaskState(phase: TaskPhase = "planning"): TaskState {
+  const defaults = TASK_PHASE_DEFAULTS[phase];
+
+  return {
+    phase,
+    task: "",
+    step: Math.max(0, getTaskPhaseIndex(phase)),
+    totalSteps: TASK_PHASES.length,
+    draftPlan: "",
+    approvedPlan: "",
+    solution: "",
+    validationReport: "",
+    violations: [],
+    done: [],
+    currentStep: defaults.currentStep,
+    expectedAction: defaults.expectedAction,
+    isPaused: false,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function isTaskPhase(value: unknown): value is TaskPhase {
+  return typeof value === "string" && TASK_PHASE_ORDER.includes(value as TaskPhase);
+}
+
+function normalizeTaskState(value: Partial<TaskState> | undefined): TaskState {
+  if (!value || typeof value !== "object") {
+    return createTaskState();
+  }
+
+  const phase = isTaskPhase(value.phase) ? value.phase : "planning";
+  const defaults = TASK_PHASE_DEFAULTS[phase];
+  const currentStep =
+    phase === "done"
+      ? defaults.currentStep
+      : typeof value.currentStep === "string" && value.currentStep.trim()
+        ? value.currentStep.trim()
+        : defaults.currentStep;
+  const expectedAction =
+    phase === "done"
+      ? defaults.expectedAction
+      : typeof value.expectedAction === "string" && value.expectedAction.trim()
+        ? value.expectedAction.trim()
+        : defaults.expectedAction;
+  const updatedAt =
+    typeof value.updatedAt === "string" &&
+    value.updatedAt.trim() &&
+    !Number.isNaN(Date.parse(value.updatedAt))
+      ? value.updatedAt
+      : new Date().toISOString();
+
+  return {
+    phase,
+    task: typeof value.task === "string" ? value.task : "",
+    step:
+      typeof value.step === "number" && Number.isFinite(value.step)
+        ? Math.max(0, Math.floor(value.step))
+        : Math.max(0, getTaskPhaseIndex(phase)),
+    totalSteps:
+      typeof value.totalSteps === "number" && Number.isFinite(value.totalSteps)
+        ? Math.max(1, Math.floor(value.totalSteps))
+        : TASK_PHASES.length,
+    draftPlan: typeof value.draftPlan === "string" ? value.draftPlan : "",
+    approvedPlan: typeof value.approvedPlan === "string" ? value.approvedPlan : "",
+    solution: typeof value.solution === "string" ? value.solution : "",
+    validationReport:
+      typeof value.validationReport === "string" ? value.validationReport : "",
+    violations: Array.isArray(value.violations)
+      ? value.violations.filter((item): item is string => typeof item === "string")
+      : [],
+    done: Array.isArray(value.done)
+      ? value.done.filter((item): item is string => typeof item === "string")
+      : [],
+    currentStep,
+    expectedAction,
+    isPaused: Boolean(value.isPaused),
+    updatedAt
+  };
+}
+
+function loadTaskState(): TaskState {
+  try {
+    const saved = localStorage.getItem(TASK_STATE_STORAGE_KEY);
+    if (!saved) {
+      return createTaskState();
+    }
+
+    return normalizeTaskState(JSON.parse(saved) as Partial<TaskState>);
+  } catch {
+    return createTaskState();
+  }
+}
+
+function canTransitionTaskPhase(from: TaskPhase, to: TaskPhase): boolean {
+  return TASK_ALLOWED_TRANSITIONS[from].includes(to);
+}
+
+function getTaskPhaseIndex(phase: TaskPhase): number {
+  return TASK_PHASE_ORDER.indexOf(phase);
+}
+
+function moveTaskStateToPhase(
+  state: TaskState,
+  phase: TaskPhase,
+  fields: Partial<TaskState> = {}
+): TaskState {
+  const defaults = TASK_PHASE_DEFAULTS[phase];
+
+  return {
+    ...state,
+    ...fields,
+    phase,
+    step: Math.max(0, getTaskPhaseIndex(phase)),
+    totalSteps: TASK_PHASES.length,
+    currentStep: fields.currentStep ?? defaults.currentStep,
+    expectedAction: fields.expectedAction ?? defaults.expectedAction,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function getOptimisticTaskStateForAction(
+  state: TaskState,
+  action: OrchestratorAction,
+  text: string
+): TaskState | undefined {
+  if (state.isPaused) {
+    return undefined;
+  }
+
+  if (state.phase === "done" && action === "userMessage") {
+    return {
+      ...createTaskState("planning"),
+      task: text
+    };
+  }
+
+  if (state.phase === "planning" && action === "approvePlan") {
+    return moveTaskStateToPhase(state, "execution", {
+      approvedPlan: state.draftPlan.trim() ? state.draftPlan : state.approvedPlan
+    });
+  }
+
+  if (state.phase === "execution" && action === "approveSolution") {
+    return moveTaskStateToPhase(state, "validation");
+  }
+
+  if (action === "disputeSolution" && state.phase === "execution") {
+    return moveTaskStateToPhase(state, "planning", {
+      currentStep: "Пересобрать план с учетом замечаний пользователя.",
+      expectedAction: "Пользователь вносит правки, Planning Agent обновляет план."
+    });
+  }
+
+  if (action === "disputeSolution" && state.phase === "validation") {
+    return moveTaskStateToPhase(state, "execution", {
+      currentStep: "Доработать решение после замечания пользователя.",
+      expectedAction: "Execution Agent исправляет решение и затем его можно снова валидировать."
+    });
+  }
+
+  return undefined;
+}
+
 function App() {
   const initialChats = useMemo(() => loadChats(), []);
   const initialUserProfiles = useMemo(() => loadUserProfiles(), []);
@@ -487,6 +717,7 @@ function App() {
   const [workingMemory, setWorkingMemory] = useState<MemoryItem[]>(() =>
     loadMemoryItems(WORKING_MEMORY_STORAGE_KEY)
   );
+  const [taskState, setTaskState] = useState<TaskState>(() => loadTaskState());
   const [lastMemoryWrites, setLastMemoryWrites] = useState<MemoryWrite[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
@@ -543,9 +774,17 @@ function App() {
       shortTerm: messages,
       shortTermSummary,
       working: workingMemory,
-      longTerm: longTermMemory
+      longTerm: longTermMemory,
+      taskState
     }),
-    [activeProfileForRequest, messages, shortTermSummary, workingMemory, longTermMemory]
+    [
+      activeProfileForRequest,
+      messages,
+      shortTermSummary,
+      workingMemory,
+      longTermMemory,
+      taskState
+    ]
   );
 
   const shortTermTurnCount = useMemo(
@@ -557,6 +796,33 @@ function App() {
     () => messages.reduce((total, message) => total + message.content.length, 0),
     [messages]
   );
+  const taskPhaseIndex = getTaskPhaseIndex(taskState.phase);
+  const taskPhaseLabel =
+    TASK_PHASES.find((phase) => phase.id === taskState.phase)?.label ?? taskState.phase;
+  const nextTaskPhase = TASK_PHASE_ORDER[taskPhaseIndex + 1];
+  const previousTaskPhase = TASK_PHASE_ORDER[taskPhaseIndex - 1];
+  const canAdvanceTask =
+    Boolean(nextTaskPhase) &&
+    !taskState.isPaused &&
+    canTransitionTaskPhase(taskState.phase, nextTaskPhase);
+  const canRewindTask =
+    Boolean(previousTaskPhase) &&
+    !taskState.isPaused &&
+    canTransitionTaskPhase(taskState.phase, previousTaskPhase);
+  const canApprovePlan =
+    settings.orchestrationEnabled &&
+    taskState.phase === "planning" &&
+    Boolean(taskState.draftPlan.trim()) &&
+    !isLoading;
+  const canApproveSolution =
+    settings.orchestrationEnabled &&
+    taskState.phase === "execution" &&
+    Boolean(taskState.solution.trim()) &&
+    !isLoading;
+  const canDisputeSolution =
+    settings.orchestrationEnabled &&
+    taskState.phase === "execution" &&
+    !isLoading;
 
   useEffect(() => {
     localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify(chats));
@@ -565,6 +831,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(WORKING_MEMORY_STORAGE_KEY, JSON.stringify(workingMemory));
   }, [workingMemory]);
+
+  useEffect(() => {
+    localStorage.setItem(TASK_STATE_STORAGE_KEY, JSON.stringify(taskState));
+  }, [taskState]);
 
   useEffect(() => {
     localStorage.setItem(USER_PROFILES_STORAGE_KEY, JSON.stringify(userProfiles));
@@ -951,14 +1221,21 @@ function App() {
     return writes;
   }
 
-  async function submitCurrentInput() {
-    const text = input.trim();
+  async function submitCurrentInput(
+    orchestratorAction: OrchestratorAction = "userMessage",
+    actionText?: string
+  ) {
+    const text = (actionText ?? input).trim();
     if (!text || isLoading || !activeChat) {
       return;
     }
 
     const requestId = crypto.randomUUID();
     const previousMessages = activeChat.messages;
+    const requestTaskState = taskState;
+    const optimisticTaskState = settings.orchestrationEnabled
+      ? getOptimisticTaskStateForAction(requestTaskState, orchestratorAction, text)
+      : undefined;
     const nextMessages: ChatMessage[] = [
       ...previousMessages,
       { role: "user", content: text }
@@ -979,6 +1256,9 @@ function App() {
     setLastReply(null);
     setLastMemoryWrites(memoryWrites);
     setIsLoading(true);
+    if (optimisticTaskState) {
+      setTaskState(optimisticTaskState);
+    }
     setAgentPhase(shouldCompressShortTerm(nextMessages, settings) ? "compressing" : "streaming");
     setStreamingContent("");
 
@@ -1012,7 +1292,8 @@ function App() {
         shortTerm: nextMessages,
         shortTermSummary,
         working: workingMemory,
-        longTerm: longTermMemory
+        longTerm: longTermMemory,
+        taskState: requestTaskState
       };
 
       const reply = await invoke<AgentReply>("send_agent_message", {
@@ -1023,7 +1304,12 @@ function App() {
           systemPrompt: settings.systemPrompt,
           messages: nextMessages,
           memoryContext: requestMemoryContext,
-          shortTermCompression
+          shortTermCompression,
+          orchestration: {
+            enabled: settings.orchestrationEnabled,
+            action: orchestratorAction,
+            validatorInvariants: settings.validatorInvariants
+          }
         }
       });
 
@@ -1039,6 +1325,9 @@ function App() {
         : undefined;
 
       setLastReply(reply);
+      if (reply.taskState) {
+        setTaskState(normalizeTaskState(reply.taskState));
+      }
       updateActiveChat(completedMessages, nextShortTermSummary);
       setLastMemoryWrites([
         ...memoryWrites,
@@ -1050,6 +1339,9 @@ function App() {
         caughtError instanceof Error ? caughtError.message : String(caughtError);
       setError(message);
       updateActiveChat(previousMessages);
+      if (optimisticTaskState) {
+        setTaskState(requestTaskState);
+      }
       setStreamingContent("");
     } finally {
       unlistenStream?.();
@@ -1065,10 +1357,69 @@ function App() {
     void submitCurrentInput();
   }
 
+  function submitOrchestratorAction(
+    action: OrchestratorAction,
+    actionText: string
+  ) {
+    void submitCurrentInput(action, actionText);
+  }
+
   function selectModel(modelId: string) {
     updateSettings({ model: modelId });
     setIsModelPickerOpen(false);
     inputRef.current?.focus();
+  }
+
+  function transitionTaskPhase(nextPhase: TaskPhase) {
+    setTaskState((current) => {
+      if (current.phase === nextPhase || !canTransitionTaskPhase(current.phase, nextPhase)) {
+        return current;
+      }
+
+      return createTaskState(nextPhase);
+    });
+  }
+
+  function advanceTaskPhase() {
+    if (nextTaskPhase && canTransitionTaskPhase(taskState.phase, nextTaskPhase)) {
+      transitionTaskPhase(nextTaskPhase);
+    }
+  }
+
+  function rewindTaskPhase() {
+    if (previousTaskPhase && canTransitionTaskPhase(taskState.phase, previousTaskPhase)) {
+      transitionTaskPhase(previousTaskPhase);
+    }
+  }
+
+  function pauseTask() {
+    setTaskState((current) => ({
+      ...current,
+      isPaused: true,
+      updatedAt: new Date().toISOString()
+    }));
+  }
+
+  function resumeTask() {
+    setTaskState((current) => ({
+      ...current,
+      isPaused: false,
+      updatedAt: new Date().toISOString()
+    }));
+  }
+
+  function resetTaskState() {
+    setTaskState(createTaskState());
+  }
+
+  function updateTaskStateText(
+    nextFields: Partial<Pick<TaskState, "currentStep" | "expectedAction">>
+  ) {
+    setTaskState((current) => ({
+      ...current,
+      ...nextFields,
+      updatedAt: new Date().toISOString()
+    }));
   }
 
   return (
@@ -1227,6 +1578,12 @@ function App() {
 
         <div className="status-strip">
           <span>profile: {activeProfileName}</span>
+          {settings.orchestrationEnabled && (
+            <span>
+              task: {taskPhaseLabel}
+              {taskState.isPaused ? " · paused" : ""}
+            </span>
+          )}
           <span>{messages.length} сообщений</span>
           <span>{estimatedChars} символов</span>
           <span>{lastReply?.model ?? settings.model}</span>
@@ -1242,6 +1599,42 @@ function App() {
         </div>
 
         <div className="messages" aria-live="polite" ref={messagesRef}>
+          {settings.orchestrationEnabled && (
+            <div
+              className={`task-stage-badge ${taskState.isPaused ? "paused" : ""}`}
+              aria-label="Этапы текущей задачи"
+            >
+              {TASK_PHASES.map((phase, index) => {
+                const isActive = phase.id === taskState.phase;
+                const isCompleted = index < taskPhaseIndex;
+
+                return (
+                  <span className="task-stage-group" key={phase.id}>
+                    <span
+                      className={`task-stage-chip ${isActive ? "active" : ""} ${
+                        isCompleted ? "completed" : ""
+                      } ${index > taskPhaseIndex ? "upcoming" : ""}`}
+                      title={`${phase.label}: ${phase.description}`}
+                    >
+                      {phase.id}
+                    </span>
+                    {index < TASK_PHASES.length - 1 && (
+                      <span
+                        className={`task-stage-arrow ${
+                          index < taskPhaseIndex ? "completed" : ""
+                        }`}
+                        aria-hidden="true"
+                      >
+                        →
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
+              {taskState.isPaused && <b className="task-paused-pill">Пауза</b>}
+            </div>
+          )}
+
           {!hasMessages && (
             <div className="empty-state">
               <span>Agent готов</span>
@@ -1285,6 +1678,50 @@ function App() {
         </div>
 
         {error && <div className="error-box">{error}</div>}
+
+        {settings.orchestrationEnabled && (
+          <div className="orchestrator-actions" aria-label="Действия оркестратора">
+            <div>
+              <strong>Оркестратор управляет этапами</strong>
+              <span>{taskState.expectedAction}</span>
+            </div>
+            <div className="orchestrator-action-buttons">
+              <button
+                type="button"
+                onClick={() =>
+                  submitOrchestratorAction("approvePlan", "✅ План одобрен")
+                }
+                disabled={!canApprovePlan}
+              >
+                Одобрить план
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  submitOrchestratorAction(
+                    "approveSolution",
+                    "✅ Решение готово к валидации"
+                  )
+                }
+                disabled={!canApproveSolution}
+              >
+                Отправить на валидацию
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  submitOrchestratorAction(
+                    "disputeSolution",
+                    "❌ Решение нужно пересмотреть. Возвращаемся к плану."
+                  )
+                }
+                disabled={!canDisputeSolution}
+              >
+                Оспорить
+              </button>
+            </div>
+          </div>
+        )}
 
         <form className="composer" onSubmit={handleSubmit}>
           <div className="composer-main">
@@ -1394,6 +1831,87 @@ function App() {
                 </div>
               </div>
             </section>
+
+            <section className="memory-section task-state-section">
+              <div>
+                <p className="eyebrow">Task State Machine</p>
+                <h2>Состояние задачи</h2>
+              </div>
+
+              <div className="task-state-card">
+                <div className="task-state-row">
+                  <span>Этап</span>
+                  <strong>{taskPhaseLabel}</strong>
+                </div>
+                <div className="task-state-row">
+                  <span>Статус</span>
+                  <strong>{taskState.isPaused ? "Пауза" : "Активно"}</strong>
+                </div>
+                <div className="task-state-row">
+                  <span>Обновлено</span>
+                  <strong>{formatChatTime(taskState.updatedAt)}</strong>
+                </div>
+              </div>
+
+              {settings.debugManualStateControls && (
+                <div className="task-state-controls" role="group" aria-label="Управление состоянием задачи">
+                  <button
+                    type="button"
+                    onClick={rewindTaskPhase}
+                    disabled={isLoading || !canRewindTask}
+                  >
+                    Назад
+                  </button>
+                  <button
+                    type="button"
+                    onClick={taskState.isPaused ? resumeTask : pauseTask}
+                    disabled={isLoading}
+                  >
+                    {taskState.isPaused ? "Продолжить" : "Пауза"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={advanceTaskPhase}
+                    disabled={isLoading || !canAdvanceTask}
+                  >
+                    Далее
+                  </button>
+                  <button type="button" onClick={resetTaskState} disabled={isLoading}>
+                    Reset
+                  </button>
+                </div>
+              )}
+
+              <label className="field">
+                <span>Текущий шаг</span>
+                <textarea
+                  value={taskState.currentStep}
+                  onChange={(event) =>
+                    updateTaskStateText({ currentStep: event.target.value })
+                  }
+                  readOnly={!settings.debugManualStateControls}
+                  rows={3}
+                />
+              </label>
+
+              <label className="field">
+                <span>Ожидаемое действие</span>
+                <textarea
+                  value={taskState.expectedAction}
+                  onChange={(event) =>
+                    updateTaskStateText({ expectedAction: event.target.value })
+                  }
+                  readOnly={!settings.debugManualStateControls}
+                  rows={3}
+                />
+              </label>
+
+              <p className="muted-text">
+                Основной сценарий: state machine переключает агент-оркестратор.
+                Ручные переходы и редактирование включаются только в debug-настройке.
+              </p>
+            </section>
+
             <section className="memory-section">
               <div className="profile-section-header">
                 <div>
@@ -1639,6 +2157,21 @@ function App() {
                     <dd>{lastReply.debug.activeProfileName ?? "none"}</dd>
                   </div>
                   <div>
+                    <dt>task</dt>
+                    <dd>
+                      {lastReply.debug.taskPhase ?? "none"}
+                      {lastReply.debug.taskPaused ? " · paused" : ""}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>task step</dt>
+                    <dd>{lastReply.debug.taskCurrentStep || "none"}</dd>
+                  </div>
+                  <div>
+                    <dt>expected</dt>
+                    <dd>{lastReply.debug.taskExpectedAction || "none"}</dd>
+                  </div>
+                  <div>
                     <dt>profile chars</dt>
                     <dd>{lastReply.debug.activeProfileChars}</dd>
                   </div>
@@ -1880,6 +2413,56 @@ function App() {
                     видимой.
                   </small>
                 </span>
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={settings.orchestrationEnabled}
+                  onChange={(event) =>
+                    updateSettings({ orchestrationEnabled: event.target.checked })
+                  }
+                />
+                <span>
+                  <b>Агент-оркестратор и stage agents</b>
+                  <small>
+                    Если включено, этапами управляет backend-оркестратор: Planning Agent,
+                    Execution Agent, Validation Agent и Done state. Если выключено,
+                    работает старый обычный чат.
+                  </small>
+                </span>
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={settings.debugManualStateControls}
+                  onChange={(event) =>
+                    updateSettings({ debugManualStateControls: event.target.checked })
+                  }
+                />
+                <span>
+                  <b>Debug: ручные переходы state machine</b>
+                  <small>
+                    Только для отладки. В основном сценарии пользователь не переключает
+                    state вручную.
+                  </small>
+                </span>
+              </label>
+
+              <label className="field">
+                <span>Инварианты валидатора</span>
+                <textarea
+                  value={settings.validatorInvariants}
+                  onChange={(event) =>
+                    updateSettings({ validatorInvariants: event.target.value })
+                  }
+                  rows={6}
+                />
+                <small>
+                  Кодовая проверка поддерживает строки `must: текст` и `forbid: текст`.
+                  Эти же правила уходят в prompt Validation Agent.
+                </small>
               </label>
 
               <label className="field">

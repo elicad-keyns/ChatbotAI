@@ -796,6 +796,231 @@ button:hover .button-icon {
   background: var(--surface-bg);
 }
 
+.task-stage-badge {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 8px;
+  max-width: min(100%, 720px);
+  margin: 0 auto 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 999px;
+  padding: 8px 10px;
+  color: var(--muted-text);
+  background: color-mix(in srgb, var(--surface-bg) 82%, transparent);
+  box-shadow: 0 16px 42px color-mix(in srgb, var(--shadow) 76%, transparent);
+  backdrop-filter: blur(16px) saturate(1.15);
+  animation: task-stage-badge-enter 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.task-stage-badge:not(.paused) .task-paused-pill {
+  display: none;
+}
+
+.task-stage-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: var(--muted-text);
+  background: var(--muted-bg);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    border-color 0.28s ease,
+    color 0.28s ease,
+    background-color 0.28s ease,
+    box-shadow 0.28s ease,
+    opacity 0.28s ease,
+    transform 0.28s ease;
+}
+
+.task-stage-chip > * {
+  position: relative;
+  z-index: 1;
+}
+
+.task-stage-chip.completed {
+  border-color: color-mix(in srgb, var(--primary) 32%, var(--border-soft));
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 11%, var(--surface-bg));
+}
+
+.task-stage-chip.active {
+  border-color: rgba(150, 215, 245, 0.64);
+  color: white;
+  isolation: isolate;
+  background: rgba(8, 31, 52, 0.96);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -1px 0 rgba(4, 14, 25, 0.42),
+    0 14px 34px rgba(31, 108, 156, 0.22);
+  animation: task-stage-chip-change 0.46s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.task-stage-chip.active::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.045);
+  pointer-events: none;
+}
+
+.task-stage-chip.active::after {
+  content: "";
+  position: absolute;
+  top: -32%;
+  bottom: -32%;
+  left: -72%;
+  width: 48%;
+  z-index: 0;
+  background:
+    linear-gradient(
+      105deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.02) 18%,
+      rgba(220, 246, 255, 0.2) 47%,
+      rgba(255, 255, 255, 0.035) 72%,
+      transparent 100%
+    );
+  mix-blend-mode: screen;
+  opacity: 0;
+  transform: translateX(0) skewX(-18deg);
+  animation: task-stage-glass-sheen 5.8s ease-in-out infinite;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+.task-stage-chip.upcoming {
+  opacity: 0.62;
+}
+
+.task-stage-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-stage-arrow {
+  color: color-mix(in srgb, var(--muted-text) 72%, transparent);
+  font-size: 14px;
+  font-weight: 900;
+  line-height: 1;
+  transition:
+    color 0.28s ease,
+    transform 0.28s ease,
+    opacity 0.28s ease;
+}
+
+.task-stage-arrow.completed {
+  color: var(--primary);
+  transform: translateX(1px);
+}
+
+.task-stage-badge.paused .task-stage-chip.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--primary) 11%, var(--surface-bg));
+  box-shadow: none;
+}
+
+.task-stage-badge.paused .task-stage-chip.active::before {
+  animation-play-state: paused;
+  opacity: 0;
+}
+
+.task-stage-badge.paused .task-stage-chip.active::after {
+  animation-play-state: paused;
+  opacity: 0;
+}
+
+.task-paused-pill {
+  align-self: center;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border-soft));
+  border-radius: 999px;
+  padding: 5px 8px;
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 9%, var(--surface-bg));
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+@keyframes task-stage-glass-sheen {
+  0% {
+    opacity: 0;
+    transform: translateX(0) skewX(-18deg);
+  }
+
+  18% {
+    opacity: 0.72;
+  }
+
+  48% {
+    opacity: 0.5;
+  }
+
+  58% {
+    opacity: 0;
+    transform: translateX(420%) skewX(-18deg);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(420%) skewX(-18deg);
+  }
+}
+
+@keyframes task-stage-chip-change {
+  0% {
+    opacity: 0.72;
+    transform: translateY(-4px) scale(0.94);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.22),
+      inset 0 -1px 0 rgba(4, 14, 25, 0.38),
+      0 0 0 rgba(86, 182, 230, 0);
+  }
+
+  58% {
+    opacity: 1;
+    transform: translateY(0) scale(1.04);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.2),
+      inset 0 -1px 0 rgba(4, 14, 25, 0.4),
+      0 18px 42px rgba(76, 173, 224, 0.34);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      inset 0 -1px 0 rgba(4, 14, 25, 0.42),
+      0 14px 34px rgba(31, 108, 156, 0.22);
+  }
+}
+
+@keyframes task-stage-badge-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-18px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .messages {
   display: flex;
   flex-direction: column;
@@ -941,6 +1166,67 @@ button:hover .button-icon {
   border-radius: 12px;
   color: var(--danger-text);
   background: var(--danger-bg);
+}
+
+.orchestrator-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 24px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  padding: 10px 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-bg) 82%, transparent);
+}
+
+.orchestrator-actions > div:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.orchestrator-actions strong {
+  font-size: 13px;
+}
+
+.orchestrator-actions span {
+  overflow: hidden;
+  color: var(--muted-text);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orchestrator-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.orchestrator-action-buttons button {
+  min-height: 32px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--surface-bg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.orchestrator-action-buttons button:hover {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+}
+
+.orchestrator-action-buttons button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .composer {
@@ -1459,6 +1745,61 @@ button:hover .button-icon {
   font-size: 13px;
 }
 
+.task-state-section .field textarea {
+  min-height: 74px;
+  resize: vertical;
+}
+
+.task-state-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 10px;
+  background: var(--surface-bg);
+}
+
+.task-state-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted-text);
+  font-size: 12px;
+}
+
+.task-state-row strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.task-state-controls {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.task-state-controls button {
+  min-height: 34px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--surface-bg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.task-state-controls button:hover {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+}
+
+.task-state-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
 .router-rules {
   display: grid;
   gap: 8px;
@@ -1688,9 +2029,35 @@ button:hover .button-icon {
 
   .messages,
   .composer,
-  .status-strip {
+  .status-strip,
+  .orchestrator-actions {
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .orchestrator-actions {
+    align-items: stretch;
+    flex-direction: column;
+    margin-left: 14px;
+    margin-right: 14px;
+  }
+
+  .orchestrator-action-buttons {
+    justify-content: stretch;
+  }
+
+  .orchestrator-action-buttons button {
+    flex: 1;
+  }
+
+  .task-stage-badge {
+    max-width: calc(100% - 28px);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .task-stage-badge::-webkit-scrollbar {
+    display: none;
   }
 
 }
@@ -1708,6 +2075,13 @@ button:hover .button-icon {
   .memory-panel:not(.collapsed) > *,
   .chat-sidebar.collapsed .collapsed-panel-button,
   .memory-panel.collapsed .collapsed-panel-button {
+    animation: none;
+  }
+
+  .task-stage-badge,
+  .task-stage-chip.active,
+  .task-stage-chip.active::before,
+  .task-stage-chip.active::after {
     animation: none;
   }
 }

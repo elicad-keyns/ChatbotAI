@@ -39,12 +39,44 @@ export interface MemoryItem {
   sourceMessage?: string;
 }
 
+export type TaskPhase = "planning" | "execution" | "validation" | "done";
+export type OrchestratorAction =
+  | "userMessage"
+  | "approvePlan"
+  | "approveSolution"
+  | "disputeSolution"
+  | "debugTransition";
+
+export interface TaskState {
+  phase: TaskPhase;
+  task: string;
+  step: number;
+  totalSteps: number;
+  draftPlan: string;
+  approvedPlan: string;
+  solution: string;
+  validationReport: string;
+  violations: string[];
+  done: string[];
+  currentStep: string;
+  expectedAction: string;
+  isPaused: boolean;
+  updatedAt: string;
+}
+
+export interface OrchestrationSettings {
+  enabled: boolean;
+  action?: OrchestratorAction;
+  validatorInvariants: string;
+}
+
 export interface MemoryContext {
   activeProfile?: UserProfile;
   shortTerm: ChatMessage[];
   shortTermSummary?: ShortTermSummary;
   working: MemoryItem[];
   longTerm: MemoryItem[];
+  taskState?: TaskState;
 }
 
 export interface MemoryDebugInfo {
@@ -68,6 +100,14 @@ export interface MemoryDebugInfo {
   promptPreview: string;
   memoryRouterInput: string;
   memoryRouterRaw: string;
+  taskPhase?: TaskPhase;
+  taskCurrentStep: string;
+  taskExpectedAction: string;
+  taskPaused: boolean;
+  orchestratorEnabled: boolean;
+  orchestratorAgent: string;
+  orchestratorAction: string;
+  validatorViolations: string[];
 }
 
 export interface MemoryDecision {
@@ -88,6 +128,7 @@ export interface AgentReply {
   shortTermSummary?: ShortTermSummary;
   debug?: MemoryDebugInfo;
   memoryDecisions?: MemoryDecision[];
+  taskState?: TaskState;
 }
 
 export interface AgentRequest {
@@ -98,6 +139,7 @@ export interface AgentRequest {
   messages: ChatMessage[];
   memoryContext: MemoryContext;
   shortTermCompression: ShortTermCompressionSettings;
+  orchestration?: OrchestrationSettings;
 }
 
 export interface AgentStreamDelta {
