@@ -17,7 +17,18 @@ export interface ShortTermCompressionSettings {
   maxUncompressedTurns: number;
 }
 
-export type MemoryLayerId = "shortTerm" | "working" | "longTerm";
+export type MemoryLayerId = "shortTerm" | "working" | "longTerm" | "userProfile";
+
+export interface UserProfile {
+  id: string;
+  name: string;
+  style: string;
+  format: string;
+  constraints: string;
+  context: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface MemoryItem {
   id: string;
@@ -29,6 +40,7 @@ export interface MemoryItem {
 }
 
 export interface MemoryContext {
+  activeProfile?: UserProfile;
   shortTerm: ChatMessage[];
   shortTermSummary?: ShortTermSummary;
   working: MemoryItem[];
@@ -51,6 +63,8 @@ export interface MemoryDebugInfo {
   shortTermCompressionTriggered: boolean;
   shortTermCompressionInput: string;
   shortTermCompressionRaw: string;
+  activeProfileName?: string;
+  activeProfileChars: number;
   promptPreview: string;
   memoryRouterInput: string;
   memoryRouterRaw: string;

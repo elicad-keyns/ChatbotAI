@@ -463,6 +463,11 @@ button:hover .button-icon {
   background: var(--primary-hover);
 }
 
+.new-chat-button.compact {
+  min-height: 34px;
+  padding: 7px 10px;
+}
+
 .new-chat-button .button-icon {
   width: 20px;
   height: 20px;
@@ -582,6 +587,144 @@ button:hover .button-icon {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.profile-switcher {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 230px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 4px;
+  background: var(--surface-bg);
+}
+
+.profile-current-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  border-radius: 9px;
+  outline: none;
+  padding: 6px 8px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: left;
+}
+
+.profile-current-button:hover,
+.profile-current-button[aria-expanded="true"] {
+  background: var(--muted-bg);
+}
+
+.profile-current-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-current-button .button-icon {
+  opacity: 0.62;
+}
+
+.profile-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 6px;
+  background: var(--surface-bg);
+  box-shadow: 0 18px 50px var(--shadow);
+}
+
+.profile-dropdown button {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 0;
+  border-radius: 9px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.profile-dropdown button:hover {
+  background: var(--muted-bg);
+}
+
+.profile-dropdown button.active {
+  color: white;
+  background: var(--primary);
+}
+
+.profile-dropdown strong,
+.profile-dropdown small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-dropdown strong {
+  font-size: 13px;
+}
+
+.profile-dropdown small {
+  color: var(--muted-text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.profile-dropdown button.active small {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.profile-action-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--muted-bg);
+  cursor: pointer;
+  padding: 0;
+}
+
+.profile-action-button:hover {
+  background: var(--border-soft);
+}
+
+.profile-action-button.danger:hover {
+  background: var(--danger-bg);
+}
+
+.profile-action-button:disabled,
+.profile-current-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.profile-action-button .button-icon {
+  width: 20px;
+  height: 20px;
 }
 
 .eyebrow {
@@ -1200,6 +1343,81 @@ button:hover .button-icon {
   font-size: 18px;
 }
 
+.profile-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.profile-list {
+  display: grid;
+  gap: 6px;
+}
+
+.profile-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 4px;
+  background: var(--surface-bg);
+}
+
+.profile-list-item.active {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface-bg));
+}
+
+.profile-list-item > button:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  border: 0;
+  border-radius: 9px;
+  padding: 8px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.profile-list-item > button:first-child:hover {
+  background: var(--muted-bg);
+}
+
+.profile-list-item strong,
+.profile-list-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-list-item strong {
+  font-size: 14px;
+}
+
+.profile-list-item small {
+  color: var(--muted-text);
+  font-size: 12px;
+}
+
+.profile-list-item button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.profile-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.profile-editor .field textarea {
+  min-height: 74px;
+}
+
 .memory-layer-list {
   display: grid;
   gap: 8px;
@@ -1454,6 +1672,11 @@ button:hover .button-icon {
   }
 
   .top-actions {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .profile-switcher {
     width: 100%;
   }
 

@@ -11,7 +11,8 @@ import type {
   MemoryLayerId,
   AgentStreamDelta,
   ShortTermCompressionSettings,
-  ShortTermSummary
+  ShortTermSummary,
+  UserProfile
 } from "./types";
 
 const DEFAULT_SYSTEM_PROMPT =
@@ -20,7 +21,16 @@ const DEFAULT_SYSTEM_PROMPT =
 const SETTINGS_STORAGE_KEY = "chatbot-ai.settings.v1";
 const CHATS_STORAGE_KEY = "chatbot-ai.chats.v1";
 const WORKING_MEMORY_STORAGE_KEY = "chatbot-ai.memory.working.v1";
-const LONG_TERM_MEMORY_STORAGE_KEY = "chatbot-ai.memory.long-term.v1";
+const USER_PROFILES_STORAGE_KEY = "chatbot-ai.user-profiles.v1";
+const ACTIVE_PROFILE_STORAGE_KEY = "chatbot-ai.active-profile.v1";
+const FIRST_PROFILE_NAME = "Профиль 1";
+const GENERATED_PROFILE_DEFAULTS = {
+  name: "Основной профиль",
+  style: "Дружелюбно, ясно, по делу.",
+  format: "Сначала краткий ответ, затем шаги или списки, если они помогают.",
+  constraints: "Не перегружать ответ лишней теорией. Учитывать русский язык интерфейса.",
+  context: "Пользователь работает с desktop AI-agent и учебными задачами по stateful-агентам."
+};
 
 const ICONS = {
   ai: new URL("../src-tauri/new_icons/ai_100.png", import.meta.url).href,
@@ -73,11 +83,16 @@ const MEMORY_LAYER_LABELS: Record<
     title: "Долгосрочная",
     scope: "все чаты",
     description: "Профиль пользователя: навыки, профессия, языки, цели, проекты и предпочтения."
+  },
+  userProfile: {
+    title: "Профиль",
+    scope: "активный пользователь",
+    description: "Явные предпочтения ответа: стиль, формат, ограничения и контекст пользователя."
   }
 };
 
 type ThemeMode = "light" | "dark";
-type PersistentMemoryLayer = Exclude<MemoryLayerId, "shortTerm">;
+type PersistentMemoryLayer = "working" | "longTerm";
 type MemoryAction = "saved" | "deleted" | "skipped";
 type AgentPhase = "idle" | "compressing" | "streaming" | "memory";
 
@@ -98,6 +113,10 @@ interface ChatSession {
   shortTermSummary?: ShortTermSummary;
   createdAt: string;
   updatedAt: string;
+}
+
+interface StoredUserProfile extends UserProfile {
+  longTermMemory: MemoryItem[];
 }
 
 interface MemoryWrite {
@@ -156,6 +175,38 @@ function createMemoryItem(
     updatedAt: now,
     sourceChatId: source?.chatId,
     sourceMessage: source?.message
+  };
+}
+
+function createDefaultUserProfile(): StoredUserProfile {
+  const now = new Date().toISOString();
+
+  return {
+    id: crypto.randomUUID(),
+    name: FIRST_PROFILE_NAME,
+    style: "",
+    format: "",
+    constraints: "",
+    context: "",
+    createdAt: now,
+    updatedAt: now,
+    longTermMemory: []
+  };
+}
+
+function createBlankUserProfile(index: number): StoredUserProfile {
+  const now = new Date().toISOString();
+
+  return {
+    id: crypto.randomUUID(),
+    name: `Профиль ${index}`,
+    style: "",
+    format: "",
+    constraints: "",
+    context: "",
+    createdAt: now,
+    updatedAt: now,
+    longTermMemory: []
   };
 }
 
@@ -231,6 +282,29 @@ function normalizeShortTermSummary(
   };
 }
 
+function normalizeMemoryItems(items: Partial<MemoryItem>[] | undefined): MemoryItem[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .filter((item) => typeof item.content === "string" && item.content.trim())
+    .map((item) => {
+      const now = new Date().toISOString();
+
+      return {
+        id: typeof item.id === "string" ? item.id : crypto.randomUUID(),
+        content: item.content?.trim() ?? "",
+        createdAt: typeof item.createdAt === "string" ? item.createdAt : now,
+        updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : now,
+        sourceChatId:
+          typeof item.sourceChatId === "string" ? item.sourceChatId : undefined,
+        sourceMessage:
+          typeof item.sourceMessage === "string" ? item.sourceMessage : undefined
+      };
+    });
+}
+
 function loadMemoryItems(storageKey: string): MemoryItem[] {
   try {
     const saved = localStorage.getItem(storageKey);
@@ -243,25 +317,81 @@ function loadMemoryItems(storageKey: string): MemoryItem[] {
       return [];
     }
 
-    return parsed
-      .filter((item) => typeof item.content === "string" && item.content.trim())
-      .map((item) => {
-        const now = new Date().toISOString();
-
-        return {
-          id: typeof item.id === "string" ? item.id : crypto.randomUUID(),
-          content: item.content?.trim() ?? "",
-          createdAt: typeof item.createdAt === "string" ? item.createdAt : now,
-          updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : now,
-          sourceChatId:
-            typeof item.sourceChatId === "string" ? item.sourceChatId : undefined,
-          sourceMessage:
-            typeof item.sourceMessage === "string" ? item.sourceMessage : undefined
-        };
-      });
+    return normalizeMemoryItems(parsed);
   } catch {
     return [];
   }
+}
+
+function normalizeStoredUserProfile(
+  profile: Partial<StoredUserProfile>,
+  index: number
+): StoredUserProfile | null {
+  if (!profile || typeof profile !== "object") {
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  const id = typeof profile.id === "string" && profile.id.trim()
+    ? profile.id
+    : crypto.randomUUID();
+  const rawName = typeof profile.name === "string" ? profile.name.trim() : "";
+  const name = rawName
+    ? rawName === GENERATED_PROFILE_DEFAULTS.name
+      ? FIRST_PROFILE_NAME
+      : rawName
+    : `Профиль ${index + 1}`;
+  const style = typeof profile.style === "string" ? profile.style : "";
+  const format = typeof profile.format === "string" ? profile.format : "";
+  const constraints = typeof profile.constraints === "string" ? profile.constraints : "";
+  const context = typeof profile.context === "string" ? profile.context : "";
+
+  return {
+    id,
+    name,
+    style: style === GENERATED_PROFILE_DEFAULTS.style ? "" : style,
+    format: format === GENERATED_PROFILE_DEFAULTS.format ? "" : format,
+    constraints: constraints === GENERATED_PROFILE_DEFAULTS.constraints ? "" : constraints,
+    context: context === GENERATED_PROFILE_DEFAULTS.context ? "" : context,
+    createdAt: typeof profile.createdAt === "string" ? profile.createdAt : now,
+    updatedAt: typeof profile.updatedAt === "string" ? profile.updatedAt : now,
+    longTermMemory: normalizeMemoryItems(profile.longTermMemory)
+  };
+}
+
+function loadUserProfiles(): StoredUserProfile[] {
+  try {
+    const saved = localStorage.getItem(USER_PROFILES_STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<StoredUserProfile>[];
+      if (Array.isArray(parsed)) {
+        const profiles = parsed
+          .map((profile, index) => normalizeStoredUserProfile(profile, index))
+          .filter((profile): profile is StoredUserProfile => Boolean(profile));
+
+        if (profiles.length > 0) {
+          return profiles;
+        }
+      }
+    }
+  } catch {
+    // Fall through to the default profile.
+  }
+
+  return [createDefaultUserProfile()];
+}
+
+function loadActiveProfileId(profiles: StoredUserProfile[]): string {
+  try {
+    const saved = localStorage.getItem(ACTIVE_PROFILE_STORAGE_KEY);
+    if (saved && profiles.some((profile) => profile.id === saved)) {
+      return saved;
+    }
+  } catch {
+    // Use the first available profile.
+  }
+
+  return profiles[0]?.id ?? "";
 }
 
 function buildChatTitle(messages: ChatMessage[]): string {
@@ -344,19 +474,23 @@ function shouldCompressShortTerm(
 
 function App() {
   const initialChats = useMemo(() => loadChats(), []);
+  const initialUserProfiles = useMemo(() => loadUserProfiles(), []);
   const [chats, setChats] = useState<ChatSession[]>(initialChats);
   const [activeChatId, setActiveChatId] = useState(initialChats[0]?.id ?? "");
   const [input, setInput] = useState("");
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+  const [userProfiles, setUserProfiles] =
+    useState<StoredUserProfile[]>(initialUserProfiles);
+  const [activeProfileId, setActiveProfileId] = useState(() =>
+    loadActiveProfileId(initialUserProfiles)
+  );
   const [workingMemory, setWorkingMemory] = useState<MemoryItem[]>(() =>
     loadMemoryItems(WORKING_MEMORY_STORAGE_KEY)
-  );
-  const [longTermMemory, setLongTermMemory] = useState<MemoryItem[]>(() =>
-    loadMemoryItems(LONG_TERM_MEMORY_STORAGE_KEY)
   );
   const [lastMemoryWrites, setLastMemoryWrites] = useState<MemoryWrite[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
+  const [isProfilePickerOpen, setIsProfilePickerOpen] = useState(false);
   const [isChatSidebarCollapsed, setIsChatSidebarCollapsed] = useState(false);
   const [isMemoryPanelCollapsed, setIsMemoryPanelCollapsed] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -366,8 +500,29 @@ function App() {
   const [lastReply, setLastReply] = useState<AgentReply | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const profileSwitcherRef = useRef<HTMLDivElement | null>(null);
 
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0];
+  const activeProfile =
+    userProfiles.find((profile) => profile.id === activeProfileId) ?? userProfiles[0];
+  const activeProfileForRequest = useMemo<UserProfile | undefined>(
+    () =>
+      activeProfile
+        ? {
+            id: activeProfile.id,
+            name: activeProfile.name,
+            style: activeProfile.style,
+            format: activeProfile.format,
+            constraints: activeProfile.constraints,
+            context: activeProfile.context,
+            createdAt: activeProfile.createdAt,
+            updatedAt: activeProfile.updatedAt
+          }
+        : undefined,
+    [activeProfile]
+  );
+  const activeProfileName = activeProfile?.name.trim() || "Без профиля";
+  const longTermMemory = activeProfile?.longTermMemory ?? [];
   const activeModelOption = MODEL_OPTIONS.find((model) => model.id === settings.model);
   const activeModelLabel = activeModelOption?.label ?? settings.model;
   const messages = activeChat?.messages ?? [];
@@ -384,12 +539,13 @@ function App() {
 
   const memoryContext = useMemo<MemoryContext>(
     () => ({
+      activeProfile: activeProfileForRequest,
       shortTerm: messages,
       shortTermSummary,
       working: workingMemory,
       longTerm: longTermMemory
     }),
-    [messages, shortTermSummary, workingMemory, longTermMemory]
+    [activeProfileForRequest, messages, shortTermSummary, workingMemory, longTermMemory]
   );
 
   const shortTermTurnCount = useMemo(
@@ -411,8 +567,12 @@ function App() {
   }, [workingMemory]);
 
   useEffect(() => {
-    localStorage.setItem(LONG_TERM_MEMORY_STORAGE_KEY, JSON.stringify(longTermMemory));
-  }, [longTermMemory]);
+    localStorage.setItem(USER_PROFILES_STORAGE_KEY, JSON.stringify(userProfiles));
+  }, [userProfiles]);
+
+  useEffect(() => {
+    localStorage.setItem(ACTIVE_PROFILE_STORAGE_KEY, activeProfileId);
+  }, [activeProfileId]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
@@ -449,12 +609,34 @@ function App() {
       if (event.key === "Escape") {
         setIsSettingsOpen(false);
         setIsModelPickerOpen(false);
+        setIsProfilePickerOpen(false);
       }
     }
 
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, []);
+
+  useEffect(() => {
+    if (!isProfilePickerOpen) {
+      return;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        profileSwitcherRef.current?.contains(target)
+      ) {
+        return;
+      }
+
+      setIsProfilePickerOpen(false);
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [isProfilePickerOpen]);
 
   function updateSettings(nextSettings: Partial<AppSettings>) {
     setSettings((current) => ({
@@ -465,6 +647,90 @@ function App() {
           ? current.shortTermCompressionTurnLimit
           : normalizeCompressionTurnLimit(nextSettings.shortTermCompressionTurnLimit)
     }));
+  }
+
+  function selectUserProfile(profileId: string) {
+    if (isLoading || !userProfiles.some((profile) => profile.id === profileId)) {
+      return;
+    }
+
+    setActiveProfileId(profileId);
+    setIsProfilePickerOpen(false);
+    setLastReply(null);
+    setLastMemoryWrites([]);
+    inputRef.current?.focus();
+  }
+
+  function createUserProfile() {
+    if (isLoading) {
+      return;
+    }
+
+    const profile = createBlankUserProfile(userProfiles.length + 1);
+    setUserProfiles((current) => [profile, ...current]);
+    setActiveProfileId(profile.id);
+    setIsProfilePickerOpen(false);
+    setLastReply(null);
+    setLastMemoryWrites([
+      createMemoryWrite(
+        "saved",
+        "userProfile",
+        profile.name,
+        "Создан новый профиль пользователя"
+      )
+    ]);
+    inputRef.current?.focus();
+  }
+
+  function deleteUserProfile(profileId: string) {
+    if (isLoading || userProfiles.length <= 1) {
+      return;
+    }
+
+    const profileToDelete = userProfiles.find((profile) => profile.id === profileId);
+    const nextProfiles = userProfiles.filter((profile) => profile.id !== profileId);
+    const safeProfiles = nextProfiles.length > 0 ? nextProfiles : [createDefaultUserProfile()];
+    const nextActiveProfileId =
+      profileId === activeProfileId ? safeProfiles[0].id : activeProfileId;
+
+    setUserProfiles(safeProfiles);
+    setActiveProfileId(nextActiveProfileId);
+    setIsProfilePickerOpen(false);
+    setLastReply(null);
+    setLastMemoryWrites([
+      createMemoryWrite(
+        "deleted",
+        "userProfile",
+        profileToDelete?.name ?? "Удаленный профиль",
+        "Профиль пользователя удален вместе с его долгосрочной памятью"
+      )
+    ]);
+    inputRef.current?.focus();
+  }
+
+  function updateActiveUserProfile(
+    nextProfile: Partial<Pick<UserProfile, "name" | "style" | "format" | "constraints" | "context">>
+  ) {
+    if (!activeProfile) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    setUserProfiles((current) =>
+      current.map((profile) =>
+        profile.id === activeProfile.id
+          ? {
+              ...profile,
+              ...nextProfile,
+              name:
+                nextProfile.name === undefined
+                  ? profile.name
+                  : nextProfile.name || "Без имени",
+              updatedAt: now
+            }
+          : profile
+      )
+    );
   }
 
   function updateActiveChat(
@@ -579,9 +845,20 @@ function App() {
       setWorkingMemory((current) =>
         current.filter((memoryItem) => memoryItem.id !== item.id)
       );
-    } else {
-      setLongTermMemory((current) =>
-        current.filter((memoryItem) => memoryItem.id !== item.id)
+    } else if (activeProfile) {
+      const now = new Date().toISOString();
+      setUserProfiles((current) =>
+        current.map((profile) =>
+          profile.id === activeProfile.id
+            ? {
+                ...profile,
+                longTermMemory: profile.longTermMemory.filter(
+                  (memoryItem) => memoryItem.id !== item.id
+                ),
+                updatedAt: now
+              }
+            : profile
+        )
       );
     }
 
@@ -656,7 +933,20 @@ function App() {
     }
 
     setWorkingMemory(nextWorkingMemory);
-    setLongTermMemory(nextLongTermMemory);
+    if (activeProfile) {
+      const now = new Date().toISOString();
+      setUserProfiles((current) =>
+        current.map((profile) =>
+          profile.id === activeProfile.id
+            ? {
+                ...profile,
+                longTermMemory: nextLongTermMemory,
+                updatedAt: now
+              }
+            : profile
+        )
+      );
+    }
 
     return writes;
   }
@@ -718,6 +1008,7 @@ function App() {
       );
 
       const requestMemoryContext: MemoryContext = {
+        activeProfile: activeProfileForRequest,
         shortTerm: nextMessages,
         shortTermSummary,
         working: workingMemory,
@@ -861,6 +1152,64 @@ function App() {
             <h1>{activeChat?.title ?? "Chatbot AI"}</h1>
           </div>
           <div className="top-actions">
+            <div
+              className="profile-switcher"
+              ref={profileSwitcherRef}
+              aria-label="Активный профиль пользователя"
+            >
+              <button
+                className="profile-current-button"
+                type="button"
+                onClick={() => setIsProfilePickerOpen((current) => !current)}
+                disabled={isLoading}
+                aria-haspopup="listbox"
+                aria-expanded={isProfilePickerOpen}
+                title="Активный профиль"
+              >
+                <span>{activeProfileName}</span>
+                <ButtonIcon className="button-icon-small" src={ICONS.arrowDown} />
+              </button>
+              <button
+                className="profile-action-button"
+                type="button"
+                onClick={createUserProfile}
+                disabled={isLoading}
+                aria-label="Создать профиль пользователя"
+                title="Создать профиль"
+              >
+                <ButtonIcon src={ICONS.plus} />
+              </button>
+              <button
+                className="profile-action-button danger"
+                type="button"
+                onClick={() => activeProfile && deleteUserProfile(activeProfile.id)}
+                disabled={isLoading || userProfiles.length <= 1}
+                aria-label="Удалить активный профиль пользователя"
+                title="Удалить активный профиль"
+              >
+                <ButtonIcon src={ICONS.cross} />
+              </button>
+              {isProfilePickerOpen && (
+                <div className="profile-dropdown" role="listbox">
+                  {userProfiles.map((profile) => (
+                    <button
+                      className={profile.id === activeProfile?.id ? "active" : ""}
+                      key={profile.id}
+                      type="button"
+                      onClick={() => selectUserProfile(profile.id)}
+                      role="option"
+                      aria-selected={profile.id === activeProfile?.id}
+                    >
+                      <strong>{profile.name || "Без имени"}</strong>
+                      <small>
+                        {profile.longTermMemory.length} долгоср. · обновлено{" "}
+                        {formatChatTime(profile.updatedAt)}
+                      </small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button className="ghost-button" type="button" onClick={clearChat}>
               Очистить чат
             </button>
@@ -877,6 +1226,7 @@ function App() {
         </header>
 
         <div className="status-strip">
+          <span>profile: {activeProfileName}</span>
           <span>{messages.length} сообщений</span>
           <span>{estimatedChars} символов</span>
           <span>{lastReply?.model ?? settings.model}</span>
@@ -898,7 +1248,7 @@ function App() {
               <p>
                 Напишите сообщение. Оно попадет в краткосрочную память текущего
                 чата, а OpenAI memory-router решит, нужно ли сохранить его в
-                рабочую или долгосрочную память.
+                рабочую память или долгосрочную память активного профиля.
               </p>
             </div>
           )}
@@ -1025,6 +1375,12 @@ function App() {
                   </b>
                 </div>
                 <div className="memory-layer">
+                  <strong>{MEMORY_LAYER_LABELS.userProfile.title}</strong>
+                  <span>{MEMORY_LAYER_LABELS.userProfile.scope}</span>
+                  <p>{MEMORY_LAYER_LABELS.userProfile.description}</p>
+                  <b>{activeProfileName}</b>
+                </div>
+                <div className="memory-layer">
                   <strong>{MEMORY_LAYER_LABELS.working.title}</strong>
                   <span>{MEMORY_LAYER_LABELS.working.scope}</span>
                   <p>{MEMORY_LAYER_LABELS.working.description}</p>
@@ -1037,6 +1393,114 @@ function App() {
                   <b>{longTermMemory.length}</b>
                 </div>
               </div>
+            </section>
+            <section className="memory-section">
+              <div className="profile-section-header">
+                <div>
+                  <p className="eyebrow">User profiles</p>
+                  <h2>Персонализация</h2>
+                </div>
+                <button
+                  className="new-chat-button compact"
+                  type="button"
+                  onClick={createUserProfile}
+                  disabled={isLoading}
+                >
+                  <ButtonIcon src={ICONS.plus} />
+                  Новый
+                </button>
+              </div>
+
+              <div className="profile-list">
+                {userProfiles.map((profile) => (
+                  <div
+                    className={`profile-list-item ${
+                      profile.id === activeProfile?.id ? "active" : ""
+                    }`}
+                    key={profile.id}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => selectUserProfile(profile.id)}
+                      disabled={isLoading}
+                    >
+                      <strong>{profile.name || "Без имени"}</strong>
+                      <small>
+                        {profile.longTermMemory.length} долгоср. · обновлено{" "}
+                        {formatChatTime(profile.updatedAt)}
+                      </small>
+                    </button>
+                    <button
+                      className="delete-chat-button"
+                      type="button"
+                      onClick={() => deleteUserProfile(profile.id)}
+                      disabled={isLoading || userProfiles.length <= 1}
+                      aria-label={`Удалить профиль ${profile.name || "Без имени"}`}
+                      title="Удалить профиль"
+                    >
+                      <ButtonIcon src={ICONS.cross} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {activeProfile && (
+                <div className="profile-editor">
+                  <label className="field">
+                    <span>Имя профиля</span>
+                    <input
+                      value={activeProfile.name}
+                      onChange={(event) =>
+                        updateActiveUserProfile({ name: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Стиль</span>
+                    <textarea
+                      value={activeProfile.style}
+                      onChange={(event) =>
+                        updateActiveUserProfile({ style: event.target.value })
+                      }
+                      placeholder="Например: кратко, дружелюбно, без лишней теории"
+                      rows={3}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Формат ответа</span>
+                    <textarea
+                      value={activeProfile.format}
+                      onChange={(event) =>
+                        updateActiveUserProfile({ format: event.target.value })
+                      }
+                      placeholder="Например: сначала вывод, потом шаги и пример кода"
+                      rows={3}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Ограничения</span>
+                    <textarea
+                      value={activeProfile.constraints}
+                      onChange={(event) =>
+                        updateActiveUserProfile({ constraints: event.target.value })
+                      }
+                      placeholder="Стек, запреты, правила проекта, лимиты"
+                      rows={3}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Контекст</span>
+                    <textarea
+                      value={activeProfile.context}
+                      onChange={(event) =>
+                        updateActiveUserProfile({ context: event.target.value })
+                      }
+                      placeholder="Кто пользователь и какой результат ему обычно нужен"
+                      rows={3}
+                    />
+                  </label>
+                </div>
+              )}
             </section>
             <section className="memory-section">
               <div>
@@ -1056,7 +1520,7 @@ function App() {
                 <p>
                   <strong>Долгосрочная:</strong> OpenAI LLM сохраняет краткую выжимку,
                   если сообщение содержит профиль: профессию, навыки, языки, цели,
-                  проекты или предпочтения пользователя.
+                  проекты или предпочтения активного пользователя.
                 </p>
                 <p>
                   <strong>Экономия:</strong> роутер получает только последнее сообщение
@@ -1169,6 +1633,14 @@ function App() {
                   <div>
                     <dt>layers</dt>
                     <dd>{lastReply.debug.includedLayers.join(", ")}</dd>
+                  </div>
+                  <div>
+                    <dt>profile</dt>
+                    <dd>{lastReply.debug.activeProfileName ?? "none"}</dd>
+                  </div>
+                  <div>
+                    <dt>profile chars</dt>
+                    <dd>{lastReply.debug.activeProfileChars}</dd>
                   </div>
                   <div>
                     <dt>input</dt>
