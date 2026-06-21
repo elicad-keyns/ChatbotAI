@@ -816,7 +816,8 @@ button:hover .button-icon {
   animation: task-stage-badge-enter 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-.task-stage-badge:not(.paused) .task-paused-pill {
+.task-stage-badge:not(.paused) .task-paused-pill,
+.task-stage-badge:not(.cancelled) .task-cancelled-pill {
   display: none;
 }
 
@@ -944,7 +945,21 @@ button:hover .button-icon {
   opacity: 0;
 }
 
-.task-paused-pill {
+.task-stage-badge.cancelled .task-stage-chip.active {
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+  background: var(--danger-bg);
+  box-shadow: none;
+}
+
+.task-stage-badge.cancelled .task-stage-chip.active::before,
+.task-stage-badge.cancelled .task-stage-chip.active::after {
+  animation-play-state: paused;
+  opacity: 0;
+}
+
+.task-paused-pill,
+.task-cancelled-pill {
   align-self: center;
   border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border-soft));
   border-radius: 999px;
@@ -953,6 +968,68 @@ button:hover .button-icon {
   background: color-mix(in srgb, var(--primary) 9%, var(--surface-bg));
   font-size: 11px;
   white-space: nowrap;
+}
+
+.task-cancelled-pill {
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+.task-swarm-strip {
+  position: sticky;
+  top: 54px;
+  z-index: 4;
+  display: grid;
+  gap: 6px;
+  align-self: flex-end;
+  width: min(260px, calc(100% - 16px));
+  margin: -2px 6px 8px auto;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border-soft));
+  border-radius: 12px;
+  padding: 8px;
+  background: color-mix(in srgb, var(--surface-bg) 88%, transparent);
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--shadow) 48%, transparent);
+  backdrop-filter: blur(14px) saturate(1.1);
+}
+
+.task-swarm-status {
+  overflow: hidden;
+  color: var(--muted-text);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-swarm-actors {
+  display: grid;
+  gap: 5px;
+}
+
+.task-swarm-actor {
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 4px 7px;
+  color: var(--muted-text);
+  background: var(--muted-bg);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  transition:
+    border-color 0.22s ease,
+    color 0.22s ease,
+    background 0.22s ease,
+    box-shadow 0.22s ease,
+    transform 0.22s ease;
+}
+
+.task-swarm-actor.active {
+  border-color: rgba(150, 215, 245, 0.72);
+  color: white;
+  background: rgba(8, 31, 52, 0.94);
+  box-shadow: 0 10px 24px rgba(31, 108, 156, 0.22);
+  transform: translateY(-1px);
 }
 
 @keyframes task-stage-glass-sheen {
@@ -1022,6 +1099,7 @@ button:hover .button-icon {
 }
 
 .messages {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -1071,6 +1149,20 @@ button:hover .button-icon {
   border: 1px solid var(--border-soft);
   color: var(--text);
   background: var(--surface-bg);
+}
+
+.message.swarm-message {
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.message.swarm-message .message-header {
+  margin: 0 0 6px 8px;
+}
+
+.message.swarm-message .swarm-stream-panel {
+  margin-bottom: 0;
 }
 
 .message-meta {
@@ -1124,6 +1216,84 @@ button:hover .button-icon {
   margin: 0;
   white-space: pre-wrap;
   line-height: 1.55;
+}
+
+.swarm-stream-panel {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border-soft));
+  border-radius: 12px;
+  padding: 9px;
+  background: color-mix(in srgb, var(--surface-bg) 92%, transparent);
+  box-shadow: 0 14px 34px color-mix(in srgb, var(--shadow) 38%, transparent);
+  backdrop-filter: blur(16px) saturate(1.08);
+}
+
+.swarm-stream-header {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.swarm-stream-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swarm-stream-header span {
+  overflow: hidden;
+  color: var(--muted-text);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swarm-stream-logs {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+}
+
+.swarm-stream-log {
+  display: grid;
+  gap: 4px;
+  border-left: 2px solid var(--border-soft);
+  padding-left: 7px;
+  opacity: 0.78;
+}
+
+.swarm-stream-log.active {
+  border-left-color: var(--primary);
+  opacity: 1;
+}
+
+.swarm-stream-log b {
+  color: var(--muted-text);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+}
+
+.swarm-stream-log p {
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.final-stream-label {
+  margin-bottom: 6px;
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
 .typing {
@@ -1222,6 +1392,15 @@ button:hover .button-icon {
 .orchestrator-action-buttons button:hover {
   border-color: var(--primary);
   background: color-mix(in srgb, var(--primary) 7%, transparent);
+}
+
+.orchestrator-action-buttons button.danger {
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+}
+
+.orchestrator-action-buttons button.danger:hover {
+  background: var(--danger-bg);
 }
 
 .orchestrator-action-buttons button:disabled {

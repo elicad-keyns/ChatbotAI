@@ -1,7 +1,13 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, error::Error, fmt};
+use std::{
+    collections::HashSet,
+    env,
+    error::Error,
+    fmt,
+    sync::{Mutex, OnceLock},
+};
 
 const MEMORY_ROUTER_MODEL: &str = "gpt-4.1-mini";
 const MEMORY_ROUTER_MAX_OUTPUT_TOKENS: u16 = 1000;
@@ -51,6 +57,7 @@ pub enum AgentError {
     MissingApiKey,
     EmptyModel,
     EmptyMessages,
+    Cancelled,
     RequestFailed(String),
     EmptyResponse,
 }
@@ -64,6 +71,7 @@ impl fmt::Display for AgentError {
             ),
             AgentError::EmptyModel => write!(formatter, "Model name is empty."),
             AgentError::EmptyMessages => write!(formatter, "Message history is empty."),
+            AgentError::Cancelled => write!(formatter, "Agent request was cancelled."),
             AgentError::RequestFailed(message) => write!(formatter, "{message}"),
             AgentError::EmptyResponse => write!(formatter, "The model returned an empty response."),
         }
@@ -71,6 +79,36 @@ impl fmt::Display for AgentError {
 }
 
 impl Error for AgentError {}
+
+static CANCELLED_AGENT_REQUESTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn cancelled_agent_requests() -> &'static Mutex<HashSet<String>> {
+    CANCELLED_AGENT_REQUESTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn cancel_agent_request(request_id: &str) {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return;
+    }
+
+    if let Ok(mut requests) = cancelled_agent_requests().lock() {
+        requests.insert(request_id.to_owned());
+    }
+}
+
+pub fn clear_agent_request(request_id: &str) {
+    if let Ok(mut requests) = cancelled_agent_requests().lock() {
+        requests.remove(request_id.trim());
+    }
+}
+
+fn is_agent_request_cancelled(request_id: &str) -> bool {
+    cancelled_agent_requests()
+        .lock()
+        .map(|requests| requests.contains(request_id.trim()))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -103,6 +141,38 @@ pub struct AgentReply {
     pub debug: MemoryDebugInfo,
     pub memory_decisions: Vec<MemoryDecision>,
     pub task_state: Option<TaskState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentStreamChunk {
+    pub delta: String,
+    pub channel: String,
+    pub actor: Option<String>,
+}
+
+impl AgentStreamChunk {
+    fn new(channel: &str, actor: Option<&str>, delta: &str) -> Self {
+        Self {
+            delta: delta.to_owned(),
+            channel: channel.to_owned(),
+            actor: actor.map(str::to_owned),
+        }
+    }
+
+    fn final_delta(actor: Option<&str>, delta: &str) -> Self {
+        Self::new("final", actor, delta)
+    }
+
+    fn swarm_delta(actor: &str, delta: &str) -> Self {
+        Self::new("swarm", Some(actor), delta)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSwarmStatus {
+    pub actors: Vec<String>,
+    pub active_actor: Option<String>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,6 +231,8 @@ pub struct TaskState {
     pub current_step: String,
     pub expected_action: String,
     pub is_paused: bool,
+    #[serde(default)]
+    pub is_cancelled: bool,
     pub updated_at: String,
 }
 
@@ -278,6 +350,7 @@ pub struct MemoryDecision {
 }
 
 pub struct Agent {
+    request_id: String,
     api_key: String,
     model: String,
     system_prompt: String,
@@ -304,6 +377,7 @@ impl Agent {
         }
 
         Ok(Self {
+            request_id: request.request_id.clone(),
             api_key,
             model,
             system_prompt: request.system_prompt.trim().to_owned(),
@@ -314,23 +388,34 @@ impl Agent {
         })
     }
 
-    pub async fn send_stream<F, G>(
+    fn ensure_not_cancelled(&self) -> Result<(), AgentError> {
+        if is_agent_request_cancelled(&self.request_id) {
+            Err(AgentError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn send_stream<F, G, H>(
         &self,
         messages: Vec<ChatMessage>,
         mut on_delta: F,
         mut on_memory_started: G,
+        on_swarm_status: H,
     ) -> Result<AgentReply, AgentError>
     where
-        F: FnMut(&str),
+        F: FnMut(AgentStreamChunk),
         G: FnMut(),
+        H: FnMut(AgentSwarmStatus),
     {
         if messages.is_empty() {
             return Err(AgentError::EmptyMessages);
         }
+        self.ensure_not_cancelled()?;
 
         if self.orchestration.enabled {
             return self
-                .send_orchestrated(messages, on_delta, on_memory_started)
+                .send_orchestrated(messages, on_delta, on_memory_started, on_swarm_status)
                 .await;
         }
 
@@ -366,6 +451,7 @@ impl Agent {
             "input": input,
             "stream": true
         });
+        self.ensure_not_cancelled()?;
 
         let instructions = combine_instructions(&self.system_prompt, &memory_instruction);
         if !instructions.is_empty() {
@@ -400,26 +486,33 @@ impl Agent {
         let mut buffer = String::new();
         let mut completed_response: Option<OpenAIResponse> = None;
 
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| AgentError::RequestFailed(error.to_string()))?
         {
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            process_sse_buffer(
-                &mut buffer,
+            let mut emit_final_delta = |delta: &str| {
+                on_delta(AgentStreamChunk::final_delta(None, delta));
+            };
+
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| AgentError::RequestFailed(error.to_string()))?
+            {
+                self.ensure_not_cancelled()?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                process_sse_buffer(
+                    &mut buffer,
+                    &mut content,
+                    &mut completed_response,
+                    &mut emit_final_delta,
+                );
+            }
+
+            process_sse_event(
+                buffer.trim(),
                 &mut content,
                 &mut completed_response,
-                &mut on_delta,
+                &mut emit_final_delta,
             );
         }
-
-        process_sse_event(
-            buffer.trim(),
-            &mut content,
-            &mut completed_response,
-            &mut on_delta,
-        );
 
         if content.trim().is_empty() {
             if let Some(text) = completed_response
@@ -427,12 +520,14 @@ impl Agent {
                 .and_then(OpenAIResponse::extract_text)
             {
                 content = text;
+                on_delta(AgentStreamChunk::final_delta(None, &content));
             }
         }
 
         if content.trim().is_empty() {
             return Err(AgentError::EmptyResponse);
         }
+        self.ensure_not_cancelled()?;
 
         let mut debug = build_memory_debug(&effective_memory_context, input_message_count, "");
         debug.input_message_count = input_message_count;
@@ -458,6 +553,7 @@ impl Agent {
         debug.short_term_compression_raw =
             preview_text(&short_term_preparation.debug.raw_output, 3000);
         on_memory_started();
+        self.ensure_not_cancelled()?;
         let memory_router_result = self.classify_memory(&latest_user_message, &content).await;
         debug.memory_router_input = preview_text(&memory_router_result.raw_input, 4000);
         debug.memory_router_raw = preview_text(&memory_router_result.raw_output, 4000);
@@ -473,16 +569,19 @@ impl Agent {
         })
     }
 
-    async fn send_orchestrated<F, G>(
+    async fn send_orchestrated<F, G, H>(
         &self,
         messages: Vec<ChatMessage>,
         mut on_delta: F,
         mut on_memory_started: G,
+        mut on_swarm_status: H,
     ) -> Result<AgentReply, AgentError>
     where
-        F: FnMut(&str),
+        F: FnMut(AgentStreamChunk),
         G: FnMut(),
+        H: FnMut(AgentSwarmStatus),
     {
+        self.ensure_not_cancelled()?;
         let latest_user_message = messages
             .iter()
             .rev()
@@ -505,6 +604,16 @@ impl Agent {
         let mut validator_violations = Vec::new();
 
         let content = match (task_state.phase.as_str(), action.as_str()) {
+            (_, "cancelTask") if task_state.phase != "done" => {
+                task_state = cancel_task_state(task_state);
+                active_agent = "ORCHESTRATOR".to_owned();
+                let content = "🛑 Задача отменена. Оркестратор больше не будет продолжать planning, execution или validation для этой задачи. Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+                on_delta(AgentStreamChunk::final_delta(
+                    Some("ORCHESTRATOR"),
+                    &content,
+                ));
+                content
+            }
             ("done", "userMessage") => {
                 task_state = normalize_task_state(None);
                 task_state.task = latest_user_message.clone();
@@ -516,15 +625,24 @@ impl Agent {
                     &latest_user_message,
                     &stage_memory_instruction,
                     &mut task_state,
+                    &mut on_delta,
                 )
                 .await?
             }
             ("done", _) => {
-                task_state.current_step = "Задача завершена.".to_owned();
+                let already_terminal_message = if task_state.is_cancelled {
+                    task_state.current_step = "Задача отменена пользователем.".to_owned();
+                    "🛑 Задача уже отменена. Оркестратор не будет продолжать ее. Напишите новый запрос, чтобы начать новую задачу."
+                } else {
+                    task_state.current_step = "Задача завершена.".to_owned();
+                    "✅ Задача уже завершена. Ее нельзя оспорить или вернуть на предыдущий этап. Напишите новый запрос, чтобы начать новую задачу."
+                };
                 task_state.expected_action =
                     "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
                 active_agent = "DONE".to_owned();
-                "✅ Задача уже завершена. Ее нельзя оспорить или вернуть на предыдущий этап. Напишите новый запрос, чтобы начать новую задачу.".to_owned()
+                let content = already_terminal_message.to_owned();
+                on_delta(AgentStreamChunk::final_delta(Some("DONE"), &content));
+                content
             }
             ("planning", "approvePlan") => {
                 task_state = transition_task_state(task_state, "execution")?;
@@ -542,6 +660,8 @@ impl Agent {
                     &stage_memory_instruction,
                     &mut task_state,
                     None,
+                    &mut on_delta,
+                    &mut on_swarm_status,
                 )
                 .await?
             }
@@ -559,6 +679,7 @@ impl Agent {
                     &latest_user_message,
                     &stage_memory_instruction,
                     &mut task_state,
+                    &mut on_delta,
                 )
                 .await?
             }
@@ -576,6 +697,8 @@ impl Agent {
                     &stage_memory_instruction,
                     &mut task_state,
                     Some(&dispute_violations),
+                    &mut on_delta,
+                    &mut on_swarm_status,
                 )
                 .await?
             }
@@ -583,11 +706,17 @@ impl Agent {
                 task_state = transition_task_state(task_state, "validation")?;
                 let validation_memory_instruction =
                     build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                on_swarm_status(AgentSwarmStatus {
+                    actors: execution_swarm_actors(),
+                    active_actor: Some("VALIDATION_GUARD".to_owned()),
+                    status: "Validation Agent проверяет финальный ответ.".to_owned(),
+                });
                 let validation = run_validation_agent(
                     self,
                     &latest_user_message,
                     &validation_memory_instruction,
                     &mut task_state,
+                    &mut on_delta,
                 )
                 .await?;
                 validator_violations = validation.violations.clone();
@@ -605,7 +734,15 @@ impl Agent {
                         "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
                     task_state.violations.clear();
                     active_agent = "DONE".to_owned();
-                    run_done_agent(self, &memory_instruction, &task_state).await?
+                    let done = run_done_agent(self, &memory_instruction, &task_state).await?;
+                    on_delta(AgentStreamChunk::final_delta(Some("DONE"), "\n\n"));
+                    on_delta(AgentStreamChunk::final_delta(Some("DONE"), &done));
+                    on_swarm_status(AgentSwarmStatus {
+                        actors: execution_swarm_actors(),
+                        active_actor: None,
+                        status: "Валидация пройдена.".to_owned(),
+                    });
+                    format!("{}\n\n{}", validation.report, done)
                 } else {
                     task_state.validation_report = validation.report.clone();
                     task_state.violations = validation.violations.clone();
@@ -615,6 +752,14 @@ impl Agent {
                         "Validation failed. Fix the solution using these violations:\n{}",
                         validation.violations.join("\n")
                     );
+                    let failure_intro = format!(
+                        "\n\n⚠️ Валидация не прошла, оркестратор вернул задачу в execution.\n\nНарушения:\n{}\n\n",
+                        validation.violations.join("\n")
+                    );
+                    on_delta(AgentStreamChunk::final_delta(
+                        Some("ORCHESTRATOR"),
+                        &failure_intro,
+                    ));
                     let stage_memory_instruction = build_memory_instruction_for_task_state(
                         &effective_memory_context,
                         &task_state,
@@ -625,13 +770,14 @@ impl Agent {
                         &stage_memory_instruction,
                         &mut task_state,
                         Some(&validation.violations),
+                        &mut on_delta,
+                        &mut on_swarm_status,
                     )
                     .await?;
 
                     format!(
-                        "⚠️ Валидация не прошла, оркестратор вернул задачу в execution.\n\nНарушения:\n{}\n\nExecution Agent подготовил исправленное решение:\n{}",
-                        validation.violations.join("\n"),
-                        corrected
+                        "{}{}\nExecution Agent подготовил исправленное решение:\n{}",
+                        validation.report, failure_intro, corrected
                     )
                 }
             }
@@ -645,6 +791,8 @@ impl Agent {
                     &stage_memory_instruction,
                     &mut task_state,
                     None,
+                    &mut on_delta,
+                    &mut on_swarm_status,
                 )
                 .await?
             }
@@ -657,6 +805,7 @@ impl Agent {
                     &latest_user_message,
                     &stage_memory_instruction,
                     &mut task_state,
+                    &mut on_delta,
                 )
                 .await?
             }
@@ -665,8 +814,7 @@ impl Agent {
         if content.trim().is_empty() {
             return Err(AgentError::EmptyResponse);
         }
-
-        on_delta(&content);
+        self.ensure_not_cancelled()?;
 
         let mut effective_memory_context = effective_memory_context;
         effective_memory_context.task_state = Some(task_state.clone());
@@ -699,6 +847,7 @@ impl Agent {
         debug.validator_violations = validator_violations;
 
         on_memory_started();
+        self.ensure_not_cancelled()?;
         let memory_router_result = self.classify_memory(&latest_user_message, &content).await;
         debug.memory_router_input = preview_text(&memory_router_result.raw_input, 4000);
         debug.memory_router_raw = preview_text(&memory_router_result.raw_output, 4000);
@@ -714,15 +863,27 @@ impl Agent {
         })
     }
 
-    async fn request_text(&self, instructions: &str, input: &str) -> Result<String, AgentError> {
+    async fn request_text_streaming<F>(
+        &self,
+        instructions: &str,
+        input: &str,
+        channel: &str,
+        actor: Option<&str>,
+        on_delta: &mut F,
+    ) -> Result<String, AgentError>
+    where
+        F: FnMut(AgentStreamChunk),
+    {
+        self.ensure_not_cancelled()?;
         let body = json!({
             "model": self.model,
             "instructions": instructions,
             "input": input,
-            "max_output_tokens": 1600
+            "max_output_tokens": 1600,
+            "stream": true
         });
 
-        let response = self
+        let mut response = self
             .client
             .post("https://api.openai.com/v1/responses")
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
@@ -733,22 +894,67 @@ impl Agent {
             .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
 
         if !status.is_success() {
+            let response_text = response
+                .text()
+                .await
+                .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
+
             return Err(AgentError::RequestFailed(format_openai_error(
                 status.as_u16(),
                 &response_text,
             )));
         }
 
-        let parsed = serde_json::from_str::<OpenAIResponse>(&response_text)
-            .map_err(|error| AgentError::RequestFailed(error.to_string()))?;
+        let mut content = String::new();
+        let mut buffer = String::new();
+        let mut completed_response: Option<OpenAIResponse> = None;
 
-        parsed.extract_text().ok_or(AgentError::EmptyResponse)
+        {
+            let mut emit_delta = |delta: &str| {
+                on_delta(AgentStreamChunk::new(channel, actor, delta));
+            };
+
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| AgentError::RequestFailed(error.to_string()))?
+            {
+                self.ensure_not_cancelled()?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                process_sse_buffer(
+                    &mut buffer,
+                    &mut content,
+                    &mut completed_response,
+                    &mut emit_delta,
+                );
+            }
+
+            process_sse_event(
+                buffer.trim(),
+                &mut content,
+                &mut completed_response,
+                &mut emit_delta,
+            );
+        }
+
+        if content.trim().is_empty() {
+            if let Some(text) = completed_response
+                .as_ref()
+                .and_then(OpenAIResponse::extract_text)
+            {
+                content = text;
+                on_delta(AgentStreamChunk::new(channel, actor, &content));
+            }
+        }
+
+        if content.trim().is_empty() {
+            return Err(AgentError::EmptyResponse);
+        }
+        self.ensure_not_cancelled()?;
+
+        Ok(content)
     }
 
     async fn prepare_short_term_messages(&self, messages: &[ChatMessage]) -> ShortTermPreparation {
@@ -1004,12 +1210,33 @@ struct ValidationResult {
     violations: Vec<String>,
 }
 
-async fn run_planning_agent(
+#[derive(Debug, Clone)]
+struct ExecutionSwarmResult {
+    final_answer: String,
+}
+
+fn execution_swarm_actors() -> Vec<String> {
+    [
+        "IMPLEMENTER",
+        "BEST_PRACTICES",
+        "VALIDATION_GUARD",
+        "INTEGRATOR",
+    ]
+    .iter()
+    .map(|actor| (*actor).to_owned())
+    .collect()
+}
+
+async fn run_planning_agent<F>(
     agent: &Agent,
     user_message: &str,
     memory_instruction: &str,
     task_state: &mut TaskState,
-) -> Result<String, AgentError> {
+    on_delta: &mut F,
+) -> Result<String, AgentError>
+where
+    F: FnMut(AgentStreamChunk),
+{
     if task_state.task.trim().is_empty() {
         task_state.task = preview_text(user_message, 260);
     }
@@ -1035,7 +1262,9 @@ async fn run_planning_agent(
         preview_text(&task_state.draft_plan, 5000),
         preview_text(&task_state.approved_plan, 5000)
     );
-    let response = agent.request_text(&instructions, &input).await?;
+    let response = agent
+        .request_text_streaming(&instructions, &input, "final", Some("PLANNING"), on_delta)
+        .await?;
 
     task_state.phase = "planning".to_owned();
     task_state.step = 0;
@@ -1050,13 +1279,19 @@ async fn run_planning_agent(
     Ok(response)
 }
 
-async fn run_execution_agent(
+async fn run_execution_agent<F, H>(
     agent: &Agent,
     user_message: &str,
     memory_instruction: &str,
     task_state: &mut TaskState,
     validation_violations: Option<&[String]>,
-) -> Result<String, AgentError> {
+    on_delta: &mut F,
+    on_swarm_status: &mut H,
+) -> Result<String, AgentError>
+where
+    F: FnMut(AgentStreamChunk),
+    H: FnMut(AgentSwarmStatus),
+{
     if task_state.approved_plan.trim().is_empty() {
         task_state.phase = "planning".to_owned();
         task_state.current_step = "Сначала нужно утвердить план.".to_owned();
@@ -1068,50 +1303,186 @@ async fn run_execution_agent(
     let violations_text = validation_violations
         .map(|items| items.join("\n"))
         .unwrap_or_else(|| "none".to_owned());
-    let instructions = combine_instructions(
-        &agent.system_prompt,
-        &format!(
-             "{memory_instruction}\n\n\
-             Stage agent role: EXECUTION.\n\
-             You are the Execution Agent. Follow the approved plan exactly and produce the solution.\n\
-             Do not renegotiate the plan unless validation feedback requires a fix. Do not mark the task as done.\n\
-             If validation violations are provided, fix the solution according to them."
-        ),
-    );
-    let input = format!(
+    let swarm_context = format!(
         "orchestrator_state: execution\n\
+         execution_mode: swarm\n\
          user_message_or_feedback:\n{}\n\n\
          approved_plan:\n{}\n\n\
          previous_solution:\n{}\n\n\
-         validation_violations:\n{}",
+         validation_violations:\n{}\n\n\
+         validator_invariants:\n{}",
         preview_text(user_message, 2400),
         preview_text(&task_state.approved_plan, 7000),
         preview_text(&task_state.solution, 7000),
-        preview_text(&violations_text, 3000)
+        preview_text(&violations_text, 3000),
+        preview_text(&agent.orchestration.validator_invariants, 3000)
     );
-    let response = agent.request_text(&instructions, &input).await?;
+    let swarm_result = run_execution_swarm(
+        agent,
+        memory_instruction,
+        &swarm_context,
+        on_delta,
+        on_swarm_status,
+    )
+    .await?;
 
     task_state.phase = "execution".to_owned();
     task_state.step = 1;
     task_state.total_steps = 4;
-    task_state.solution = response.clone();
+    task_state.solution = swarm_result.final_answer.clone();
     task_state.current_step =
-        "Проверить решение и решить, отправлять ли его на валидацию.".to_owned();
+        "Execution Swarm подготовил решение по утвержденному плану.".to_owned();
     task_state.expected_action =
         "Пользователь может отправить решение на валидацию или оспорить его.".to_owned();
     task_state.updated_at = String::new();
     task_state.validation_report.clear();
     task_state.violations.clear();
 
-    Ok(response)
+    Ok(swarm_result.final_answer)
 }
 
-async fn run_validation_agent(
+async fn run_execution_swarm<F, H>(
+    agent: &Agent,
+    memory_instruction: &str,
+    swarm_context: &str,
+    on_delta: &mut F,
+    on_swarm_status: &mut H,
+) -> Result<ExecutionSwarmResult, AgentError>
+where
+    F: FnMut(AgentStreamChunk),
+    H: FnMut(AgentSwarmStatus),
+{
+    let actors = execution_swarm_actors();
+    on_swarm_status(AgentSwarmStatus {
+        actors: actors.clone(),
+        active_actor: Some("IMPLEMENTER".to_owned()),
+        status: "IMPLEMENTER готовит черновик решения.".to_owned(),
+    });
+    let implementer = run_execution_swarm_member(
+        agent,
+        memory_instruction,
+        "IMPLEMENTER",
+        "Produce the concrete solution draft. Follow the approved plan and validation feedback. Do not mark the task as done.",
+        swarm_context,
+        on_delta,
+    )
+    .await?;
+    let best_practices_input = format!(
+        "{swarm_context}\n\nimplementation_draft:\n{}",
+        preview_text(&implementer, 7000)
+    );
+    on_swarm_status(AgentSwarmStatus {
+        actors: actors.clone(),
+        active_actor: Some("BEST_PRACTICES".to_owned()),
+        status: "BEST_PRACTICES предлагает улучшения.".to_owned(),
+    });
+    let best_practices = run_execution_swarm_member(
+        agent,
+        memory_instruction,
+        "BEST_PRACTICES",
+        "Review the draft for better practices, simpler structure, correctness, maintainability, and clarity. Suggest concrete improvements only.",
+        &best_practices_input,
+        on_delta,
+    )
+    .await?;
+    let guard_input = format!(
+        "{best_practices_input}\n\nbest_practices_review:\n{}",
+        preview_text(&best_practices, 5000)
+    );
+    on_swarm_status(AgentSwarmStatus {
+        actors: actors.clone(),
+        active_actor: Some("VALIDATION_GUARD".to_owned()),
+        status: "VALIDATION_GUARD сверяет решение с планом и ограничениями.".to_owned(),
+    });
+    let validation_guard = run_execution_swarm_member(
+        agent,
+        memory_instruction,
+        "VALIDATION_GUARD",
+        "Check the draft against the approved plan, validation violations, and validator invariants. Identify missing requirements or risky choices.",
+        &guard_input,
+        on_delta,
+    )
+    .await?;
+    let integrator_input = format!(
+        "{guard_input}\n\nvalidation_guard_review:\n{}",
+        preview_text(&validation_guard, 5000)
+    );
+    on_swarm_status(AgentSwarmStatus {
+        actors: actors.clone(),
+        active_actor: Some("INTEGRATOR".to_owned()),
+        status: "INTEGRATOR собирает финальный ответ.".to_owned(),
+    });
+    let instructions = combine_instructions(
+        &agent.system_prompt,
+        &format!(
+            "{memory_instruction}\n\n\
+             Stage agent role: EXECUTION_SWARM_INTEGRATOR.\n\
+             You are the final Integrator of the Execution Swarm. Combine the implementer draft, best-practices review, and validation-guard review into one user-facing answer.\n\
+             Follow the approved plan exactly. Apply validation feedback when provided. Do not mark the task as done and do not ask for approval here.\n\
+             Output contract: return only the final solution/deliverable itself.\n\
+             Do not add your own comments, prefaces, summaries, conclusions, notes, caveats, validation remarks, or meta text.\n\
+             Do not write phrases like \"here is\", \"below\", \"I prepared\", \"final answer\", \"done\", or similar wrappers.\n\
+             If the deliverable is code, output only the code required by the task; do not add explanatory prose or extra comments unless the user explicitly requested comments as part of the code.\n\
+             Do not include the swarm transcript; it is shown separately in the UI."
+        ),
+    );
+
+    let final_answer = agent
+        .request_text_streaming(
+            &instructions,
+            &integrator_input,
+            "final",
+            Some("INTEGRATOR"),
+            on_delta,
+        )
+        .await?;
+
+    on_swarm_status(AgentSwarmStatus {
+        actors,
+        active_actor: None,
+        status: "Execution Swarm завершил обсуждение.".to_owned(),
+    });
+
+    Ok(ExecutionSwarmResult { final_answer })
+}
+
+async fn run_execution_swarm_member<F>(
+    agent: &Agent,
+    memory_instruction: &str,
+    role: &str,
+    role_goal: &str,
+    input: &str,
+    on_delta: &mut F,
+) -> Result<String, AgentError>
+where
+    F: FnMut(AgentStreamChunk),
+{
+    let instructions = combine_instructions(
+        &agent.system_prompt,
+        &format!(
+            "{memory_instruction}\n\n\
+             Stage agent role: EXECUTION_SWARM_{role}.\n\
+             You are one specialist inside the Execution Swarm. {role_goal}\n\
+             Collaborate through concise, practical notes. Do not talk to the user directly and do not mark the task as done."
+        ),
+    );
+
+    on_delta(AgentStreamChunk::swarm_delta(role, ""));
+    agent
+        .request_text_streaming(&instructions, input, "swarm", Some(role), on_delta)
+        .await
+}
+
+async fn run_validation_agent<F>(
     agent: &Agent,
     user_message: &str,
     memory_instruction: &str,
     task_state: &mut TaskState,
-) -> Result<ValidationResult, AgentError> {
+    on_delta: &mut F,
+) -> Result<ValidationResult, AgentError>
+where
+    F: FnMut(AgentStreamChunk),
+{
     let code_violations = check_validator_invariants(
         &task_state.solution,
         &agent.orchestration.validator_invariants,
@@ -1150,7 +1521,9 @@ async fn run_validation_agent(
             code_violations.join("\n")
         }
     );
-    let report = agent.request_text(&instructions, &input).await?;
+    let report = agent
+        .request_text_streaming(&instructions, &input, "final", Some("VALIDATION"), on_delta)
+        .await?;
 
     task_state.phase = "validation".to_owned();
     task_state.step = 2;
@@ -1192,6 +1565,7 @@ fn normalize_orchestrator_action(action: Option<&str>) -> String {
         "approvePlan" => "approvePlan",
         "approveSolution" => "approveSolution",
         "disputeSolution" => "disputeSolution",
+        "cancelTask" => "cancelTask",
         "debugTransition" => "debugTransition",
         _ => "userMessage",
     }
@@ -1213,6 +1587,7 @@ fn normalize_task_state(task_state: Option<TaskState>) -> TaskState {
         current_step: "Сформировать план задачи".to_owned(),
         expected_action: "Опишите цель или подтвердите план переходом к execution.".to_owned(),
         is_paused: false,
+        is_cancelled: false,
         updated_at: String::new(),
     });
 
@@ -1231,10 +1606,33 @@ fn normalize_task_state(task_state: Option<TaskState>) -> TaskState {
         _ => 0,
     };
     state.total_steps = 4;
-    if state.phase == "done" {
-        state.current_step = "Задача завершена.".to_owned();
-        state.expected_action = "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+    if state.phase != "done" {
+        state.is_cancelled = false;
     }
+
+    if state.phase == "done" {
+        if state.is_cancelled {
+            state.current_step = "Задача отменена пользователем.".to_owned();
+            state.expected_action = "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+        } else {
+            state.current_step = "Задача завершена.".to_owned();
+            state.expected_action = "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+        }
+    }
+    state
+}
+
+fn cancel_task_state(mut state: TaskState) -> TaskState {
+    state.phase = "done".to_owned();
+    state.step = 3;
+    state.total_steps = 4;
+    state.is_paused = false;
+    state.is_cancelled = true;
+    state.violations.clear();
+    state.done = vec!["Задача отменена пользователем".to_owned()];
+    state.current_step = "Задача отменена пользователем.".to_owned();
+    state.expected_action = "Напишите новый запрос, чтобы начать новую задачу.".to_owned();
+    state.updated_at = String::new();
     state
 }
 
@@ -1255,6 +1653,9 @@ fn transition_task_state(mut state: TaskState, target: &str) -> Result<TaskState
     }
 
     state.phase = target.to_owned();
+    if target != "done" {
+        state.is_cancelled = false;
+    }
     state.step = match target {
         "planning" => 0,
         "execution" => 1,
@@ -1705,7 +2106,9 @@ fn format_task_state(task_state: Option<&TaskState>) -> String {
     let phase = preview_text(&task_state.phase, 80);
     let current_step = preview_text(&task_state.current_step, 520);
     let expected_action = preview_text(&task_state.expected_action, 520);
-    let status = if task_state.is_paused {
+    let status = if task_state.is_cancelled {
+        "cancelled"
+    } else if task_state.is_paused {
         "paused"
     } else {
         "active"
@@ -1726,7 +2129,7 @@ fn format_task_state(task_state: Option<&TaskState>) -> String {
          violations: {}\n\
          updatedAt: {}\n\
          Allowed flow: planning -> execution -> validation -> done. Execution may return to planning; validation may return to execution.\n\
-         Respect the current phase and expected action. Stage transitions are controlled by backend code, not by user text. If status is paused, do not advance the task or repeat earlier explanations; only answer resume/status requests briefly. After resume, continue from currentStep without restating completed phases.",
+         Respect the current phase and expected action. Stage transitions are controlled by backend code, not by user text. If status is paused, do not advance the task or repeat earlier explanations; only answer resume/status requests briefly. After resume, continue from currentStep without restating completed phases. If status is cancelled, the task is terminal; do not continue planning, execution, or validation for it.",
         preview_text(&task_state.task, 500),
         task_state.step + 1,
         task_state.total_steps,
@@ -2066,6 +2469,7 @@ mod tests {
                 current_step: "Собрать основной функционал".to_owned(),
                 expected_action: "Продолжить реализацию без повторения плана".to_owned(),
                 is_paused: false,
+                is_cancelled: false,
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
             }),
         };

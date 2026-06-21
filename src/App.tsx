@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AgentReply,
   AgentMemoryStarted,
+  AgentSwarmStatus,
   ChatMessage,
   MemoryContext,
   MemoryDecision,
@@ -13,6 +14,7 @@ import type {
   OrchestratorAction,
   ShortTermCompressionSettings,
   ShortTermSummary,
+  SwarmDiscussion,
   TaskPhase,
   TaskState,
   UserProfile
@@ -143,6 +145,13 @@ const TASK_PHASE_DEFAULTS: Record<
     expectedAction: "Напишите новый запрос, чтобы начать новую задачу."
   }
 };
+
+const TASK_CANCELLED_DEFAULTS = {
+  currentStep: "Задача отменена пользователем.",
+  expectedAction: "Напишите новый запрос, чтобы начать новую задачу."
+};
+const TASK_CANCEL_MESSAGE =
+  "🛑 Задача отменена. Оркестратор больше не будет продолжать planning, execution или validation для этой задачи.";
 
 const TASK_PHASE_ORDER = TASK_PHASES.map((phase) => phase.id);
 const TASK_ALLOWED_TRANSITIONS: Record<TaskPhase, TaskPhase[]> = {
@@ -320,6 +329,11 @@ function loadChats(): ChatSession[] {
 
     return parsed.map((chat) => ({
       ...chat,
+      messages: Array.isArray(chat.messages)
+        ? chat.messages
+            .map((message) => normalizeChatMessage(message))
+            .filter((message): message is ChatMessage => Boolean(message))
+        : [],
       shortTermSummary: normalizeShortTermSummary(chat.shortTermSummary)
     }));
   } catch {
@@ -489,6 +503,165 @@ function getRoleLabel(role: ChatMessage["role"]): string {
   return role === "user" ? "Вы" : "Agent";
 }
 
+function hasAnySwarmLog(logs: Record<string, string>): boolean {
+  return Object.values(logs).some((value) => value.trim());
+}
+
+function getOrderedSwarmActors(
+  actors: string[],
+  logs: Record<string, string>
+): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+
+  for (const actor of actors) {
+    if (actor && logs[actor]?.trim() && !seen.has(actor)) {
+      seen.add(actor);
+      ordered.push(actor);
+    }
+  }
+
+  for (const actor of Object.keys(logs)) {
+    if (actor && logs[actor]?.trim() && !seen.has(actor)) {
+      seen.add(actor);
+      ordered.push(actor);
+    }
+  }
+
+  return ordered;
+}
+
+function normalizeSwarmLogs(logs: Record<string, unknown>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(logs)
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+      .map(([actor, log]) => [actor.trim(), log.trim()] as const)
+      .filter(([actor, log]) => actor && log)
+  );
+}
+
+function formatSwarmTranscript(actors: string[], logs: Record<string, string>): string {
+  const normalizedLogs = normalizeSwarmLogs(logs);
+  const orderedActors = getOrderedSwarmActors(actors, normalizedLogs);
+
+  return [
+    "Execution Swarm",
+    ...orderedActors.map((actor) => `${actor}\n${normalizedLogs[actor]}`)
+  ].join("\n\n");
+}
+
+function createSwarmDiscussionMessage(
+  actors: string[],
+  logs: Record<string, string>,
+  status: string
+): ChatMessage | undefined {
+  const normalizedLogs = normalizeSwarmLogs(logs);
+  if (!hasAnySwarmLog(normalizedLogs)) {
+    return undefined;
+  }
+
+  const orderedActors = getOrderedSwarmActors(actors, normalizedLogs);
+  const discussion: SwarmDiscussion = {
+    actors: orderedActors,
+    logs: normalizedLogs,
+    status: status.trim() || "Execution Swarm завершил обсуждение."
+  };
+
+  return {
+    role: "assistant",
+    kind: "swarm",
+    content: formatSwarmTranscript(orderedActors, normalizedLogs),
+    swarm: discussion
+  };
+}
+
+function normalizeSwarmDiscussion(value: unknown): SwarmDiscussion | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const raw = value as Partial<SwarmDiscussion>;
+  const logs =
+    raw.logs && typeof raw.logs === "object"
+      ? normalizeSwarmLogs(raw.logs as Record<string, unknown>)
+      : {};
+
+  if (!hasAnySwarmLog(logs)) {
+    return undefined;
+  }
+
+  const actors = Array.isArray(raw.actors)
+    ? raw.actors.filter((actor): actor is string => typeof actor === "string")
+    : Object.keys(logs);
+
+  return {
+    actors: getOrderedSwarmActors(actors, logs),
+    logs,
+    status: typeof raw.status === "string" && raw.status.trim()
+      ? raw.status.trim()
+      : "Execution Swarm"
+  };
+}
+
+function normalizeChatMessage(message: Partial<ChatMessage>): ChatMessage | null {
+  if (!message || (message.role !== "user" && message.role !== "assistant")) {
+    return null;
+  }
+
+  if (message.kind === "swarm") {
+    const swarm = normalizeSwarmDiscussion(message.swarm);
+    if (!swarm) {
+      return null;
+    }
+
+    return {
+      role: "assistant",
+      kind: "swarm",
+      content: formatSwarmTranscript(swarm.actors, swarm.logs),
+      swarm
+    };
+  }
+
+  if (typeof message.content !== "string") {
+    return null;
+  }
+
+  return {
+    role: message.role,
+    content: message.content
+  };
+}
+
+function SwarmDiscussionPanel({
+  discussion,
+  activeActor
+}: {
+  discussion: SwarmDiscussion;
+  activeActor?: string | null;
+}) {
+  const actors = getOrderedSwarmActors(discussion.actors, discussion.logs);
+
+  return (
+    <div className="swarm-stream-panel" aria-label="Обсуждение execution swarm">
+      <div className="swarm-stream-header">
+        <strong>Execution Swarm</strong>
+        <span>{discussion.status || "Обсуждение решения"}</span>
+      </div>
+      <div className="swarm-stream-logs">
+        {actors.map((actor) => (
+          <div
+            className={`swarm-stream-log ${actor === activeActor ? "active" : ""}`}
+            key={actor}
+          >
+            <b>{actor}</b>
+            <p>{discussion.logs[actor]}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function getMemoryActionLabel(action: MemoryAction): string {
   if (action === "saved") {
     return "сохранено";
@@ -556,6 +729,7 @@ function createTaskState(phase: TaskPhase = "planning"): TaskState {
     currentStep: defaults.currentStep,
     expectedAction: defaults.expectedAction,
     isPaused: false,
+    isCancelled: false,
     updatedAt: new Date().toISOString()
   };
 }
@@ -571,15 +745,18 @@ function normalizeTaskState(value: Partial<TaskState> | undefined): TaskState {
 
   const phase = isTaskPhase(value.phase) ? value.phase : "planning";
   const defaults = TASK_PHASE_DEFAULTS[phase];
+  const isCancelled = phase === "done" && Boolean(value.isCancelled);
+  const terminalDefaults =
+    phase === "done" && isCancelled ? TASK_CANCELLED_DEFAULTS : defaults;
   const currentStep =
     phase === "done"
-      ? defaults.currentStep
+      ? terminalDefaults.currentStep
       : typeof value.currentStep === "string" && value.currentStep.trim()
         ? value.currentStep.trim()
         : defaults.currentStep;
   const expectedAction =
     phase === "done"
-      ? defaults.expectedAction
+      ? terminalDefaults.expectedAction
       : typeof value.expectedAction === "string" && value.expectedAction.trim()
         ? value.expectedAction.trim()
         : defaults.expectedAction;
@@ -615,6 +792,7 @@ function normalizeTaskState(value: Partial<TaskState> | undefined): TaskState {
     currentStep,
     expectedAction,
     isPaused: Boolean(value.isPaused),
+    isCancelled,
     updatedAt
   };
 }
@@ -653,10 +831,22 @@ function moveTaskStateToPhase(
     phase,
     step: Math.max(0, getTaskPhaseIndex(phase)),
     totalSteps: TASK_PHASES.length,
+    isCancelled: fields.isCancelled ?? (phase === "done" ? state.isCancelled : false),
     currentStep: fields.currentStep ?? defaults.currentStep,
     expectedAction: fields.expectedAction ?? defaults.expectedAction,
     updatedAt: new Date().toISOString()
   };
+}
+
+function createCancelledTaskState(state: TaskState): TaskState {
+  return moveTaskStateToPhase(state, "done", {
+    isPaused: false,
+    isCancelled: true,
+    violations: [],
+    done: ["Задача отменена пользователем"],
+    currentStep: TASK_CANCELLED_DEFAULTS.currentStep,
+    expectedAction: TASK_CANCELLED_DEFAULTS.expectedAction
+  });
 }
 
 function getOptimisticTaskStateForAction(
@@ -664,8 +854,8 @@ function getOptimisticTaskStateForAction(
   action: OrchestratorAction,
   text: string
 ): TaskState | undefined {
-  if (state.isPaused) {
-    return undefined;
+  if (action === "cancelTask" && state.phase !== "done") {
+    return createCancelledTaskState(state);
   }
 
   if (state.phase === "done" && action === "userMessage") {
@@ -673,6 +863,10 @@ function getOptimisticTaskStateForAction(
       ...createTaskState("planning"),
       task: text
     };
+  }
+
+  if (state.isPaused || state.isCancelled) {
+    return undefined;
   }
 
   if (state.phase === "planning" && action === "approvePlan") {
@@ -727,10 +921,16 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>("idle");
   const [streamingContent, setStreamingContent] = useState("");
+  const [swarmActors, setSwarmActors] = useState<string[]>([]);
+  const [activeSwarmActor, setActiveSwarmActor] = useState<string | null>(null);
+  const [swarmStatus, setSwarmStatus] = useState("");
+  const [swarmActorLogs, setSwarmActorLogs] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [lastReply, setLastReply] = useState<AgentReply | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const activeRequestIdRef = useRef<string | null>(null);
+  const cancelledRequestIdsRef = useRef<Set<string>>(new Set());
   const profileSwitcherRef = useRef<HTMLDivElement | null>(null);
 
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0];
@@ -804,25 +1004,39 @@ function App() {
   const canAdvanceTask =
     Boolean(nextTaskPhase) &&
     !taskState.isPaused &&
+    !taskState.isCancelled &&
     canTransitionTaskPhase(taskState.phase, nextTaskPhase);
   const canRewindTask =
     Boolean(previousTaskPhase) &&
     !taskState.isPaused &&
+    !taskState.isCancelled &&
     canTransitionTaskPhase(taskState.phase, previousTaskPhase);
   const canApprovePlan =
     settings.orchestrationEnabled &&
     taskState.phase === "planning" &&
     Boolean(taskState.draftPlan.trim()) &&
+    !taskState.isCancelled &&
     !isLoading;
   const canApproveSolution =
     settings.orchestrationEnabled &&
     taskState.phase === "execution" &&
     Boolean(taskState.solution.trim()) &&
+    !taskState.isCancelled &&
     !isLoading;
   const canDisputeSolution =
     settings.orchestrationEnabled &&
     taskState.phase === "execution" &&
+    !taskState.isCancelled &&
     !isLoading;
+  const canCancelTask =
+    settings.orchestrationEnabled &&
+    taskState.phase !== "done" &&
+    !taskState.isCancelled;
+  const hasSwarmActivity =
+    settings.orchestrationEnabled &&
+    swarmActors.length > 0 &&
+    (isLoading || taskState.phase === "execution" || taskState.phase === "validation");
+  const hasSwarmLogs = hasAnySwarmLog(swarmActorLogs);
 
   useEffect(() => {
     localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify(chats));
@@ -869,6 +1083,7 @@ function App() {
     activeChatId,
     messages.length,
     streamingContent,
+    swarmActorLogs,
     agentPhase,
     isLoading,
     settings.autoScroll
@@ -1231,6 +1446,11 @@ function App() {
     }
 
     const requestId = crypto.randomUUID();
+    activeRequestIdRef.current = requestId;
+    cancelledRequestIdsRef.current.delete(requestId);
+    let requestSwarmActors: string[] = [];
+    let requestSwarmStatus = "";
+    const requestSwarmLogs: Record<string, string> = {};
     const previousMessages = activeChat.messages;
     const requestTaskState = taskState;
     const optimisticTaskState = settings.orchestrationEnabled
@@ -1261,19 +1481,36 @@ function App() {
     }
     setAgentPhase(shouldCompressShortTerm(nextMessages, settings) ? "compressing" : "streaming");
     setStreamingContent("");
+    setSwarmActors([]);
+    setActiveSwarmActor(null);
+    setSwarmStatus("");
+    setSwarmActorLogs({});
 
     let unlistenStream: (() => void) | undefined;
     let unlistenMemory: (() => void) | undefined;
+    let unlistenSwarm: (() => void) | undefined;
 
     try {
       unlistenStream = await listen<AgentStreamDelta>(
         "agent_stream_delta",
         (event) => {
-          if (event.payload.requestId !== requestId) {
+          if (
+            event.payload.requestId !== requestId ||
+            cancelledRequestIdsRef.current.has(requestId)
+          ) {
             return;
           }
 
-          setStreamingContent((current) => current + event.payload.delta);
+          if ((event.payload.channel ?? "final") === "swarm") {
+            const actor = event.payload.actor ?? "SWARM";
+            requestSwarmLogs[actor] = `${requestSwarmLogs[actor] ?? ""}${event.payload.delta}`;
+            setSwarmActorLogs((current) => ({
+              ...current,
+              [actor]: `${current[actor] ?? ""}${event.payload.delta}`
+            }));
+          } else {
+            setStreamingContent((current) => current + event.payload.delta);
+          }
           setAgentPhase((current) => (current === "compressing" ? "streaming" : current));
         }
       );
@@ -1281,9 +1518,30 @@ function App() {
       unlistenMemory = await listen<AgentMemoryStarted>(
         "agent_memory_started",
         (event) => {
-          if (event.payload.requestId === requestId) {
+          if (
+            event.payload.requestId === requestId &&
+            !cancelledRequestIdsRef.current.has(requestId)
+          ) {
             setAgentPhase("memory");
           }
+        }
+      );
+
+      unlistenSwarm = await listen<AgentSwarmStatus>(
+        "agent_swarm_status",
+        (event) => {
+          if (
+            event.payload.requestId !== requestId ||
+            cancelledRequestIdsRef.current.has(requestId)
+          ) {
+            return;
+          }
+
+          requestSwarmActors = event.payload.actors;
+          requestSwarmStatus = event.payload.status;
+          setSwarmActors(event.payload.actors);
+          setActiveSwarmActor(event.payload.activeActor ?? null);
+          setSwarmStatus(event.payload.status);
         }
       );
 
@@ -1313,8 +1571,18 @@ function App() {
         }
       });
 
+      if (cancelledRequestIdsRef.current.has(requestId)) {
+        return;
+      }
+
+      const swarmMessage = createSwarmDiscussionMessage(
+        requestSwarmActors,
+        requestSwarmLogs,
+        requestSwarmStatus
+      );
       const completedMessages: ChatMessage[] = [
         ...nextMessages,
+        ...(swarmMessage ? [swarmMessage] : []),
         { role: "assistant", content: reply.content }
       ];
       const nextShortTermSummary = reply.shortTermSummary
@@ -1335,6 +1603,13 @@ function App() {
       ]);
       setStreamingContent("");
     } catch (caughtError) {
+      if (
+        cancelledRequestIdsRef.current.has(requestId) ||
+        activeRequestIdRef.current !== requestId
+      ) {
+        return;
+      }
+
       const message =
         caughtError instanceof Error ? caughtError.message : String(caughtError);
       setError(message);
@@ -1346,9 +1621,14 @@ function App() {
     } finally {
       unlistenStream?.();
       unlistenMemory?.();
-      setIsLoading(false);
-      setAgentPhase("idle");
-      inputRef.current?.focus();
+      unlistenSwarm?.();
+      cancelledRequestIdsRef.current.delete(requestId);
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestIdRef.current = null;
+        setIsLoading(false);
+        setAgentPhase("idle");
+        inputRef.current?.focus();
+      }
     }
   }
 
@@ -1362,6 +1642,48 @@ function App() {
     actionText: string
   ) {
     void submitCurrentInput(action, actionText);
+  }
+
+  function cancelTask() {
+    if (!canCancelTask || !activeChat) {
+      return;
+    }
+
+    if (!isLoading) {
+      submitOrchestratorAction("cancelTask", "🛑 Отменить текущую задачу");
+      return;
+    }
+
+    const requestId = activeRequestIdRef.current;
+    if (requestId) {
+      cancelledRequestIdsRef.current.add(requestId);
+      void invoke("cancel_agent_message", { requestId }).catch(() => undefined);
+      activeRequestIdRef.current = null;
+    }
+
+    setTaskState((current) => createCancelledTaskState(current));
+    setStreamingContent("");
+    setSwarmActors([]);
+    setActiveSwarmActor(null);
+    setSwarmStatus("");
+    setSwarmActorLogs({});
+    setLastReply(null);
+    setError(null);
+    setIsLoading(false);
+    setAgentPhase("idle");
+
+    const alreadyCancelled =
+      activeChat.messages[activeChat.messages.length - 1]?.role === "assistant" &&
+      activeChat.messages[activeChat.messages.length - 1]?.content === TASK_CANCEL_MESSAGE;
+
+    if (!alreadyCancelled) {
+      updateActiveChat([
+        ...activeChat.messages,
+        { role: "assistant", content: TASK_CANCEL_MESSAGE }
+      ]);
+    }
+
+    inputRef.current?.focus();
   }
 
   function selectModel(modelId: string) {
@@ -1581,7 +1903,7 @@ function App() {
           {settings.orchestrationEnabled && (
             <span>
               task: {taskPhaseLabel}
-              {taskState.isPaused ? " · paused" : ""}
+              {taskState.isCancelled ? " · cancelled" : taskState.isPaused ? " · paused" : ""}
             </span>
           )}
           <span>{messages.length} сообщений</span>
@@ -1601,7 +1923,9 @@ function App() {
         <div className="messages" aria-live="polite" ref={messagesRef}>
           {settings.orchestrationEnabled && (
             <div
-              className={`task-stage-badge ${taskState.isPaused ? "paused" : ""}`}
+              className={`task-stage-badge ${taskState.isPaused ? "paused" : ""} ${
+                taskState.isCancelled ? "cancelled" : ""
+              }`}
               aria-label="Этапы текущей задачи"
             >
               {TASK_PHASES.map((phase, index) => {
@@ -1632,6 +1956,25 @@ function App() {
                 );
               })}
               {taskState.isPaused && <b className="task-paused-pill">Пауза</b>}
+              {taskState.isCancelled && <b className="task-cancelled-pill">Отменено</b>}
+            </div>
+          )}
+
+          {hasSwarmActivity && (
+            <div className="task-swarm-strip" aria-label="Акторы execution swarm">
+              <span className="task-swarm-status">{swarmStatus || "Execution Swarm"}</span>
+              <div className="task-swarm-actors">
+                {swarmActors.map((actor) => (
+                  <span
+                    className={`task-swarm-actor ${
+                      actor === activeSwarmActor ? "active" : ""
+                    }`}
+                    key={actor}
+                  >
+                    {actor}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
 
@@ -1647,24 +1990,50 @@ function App() {
           )}
 
           {messages.map((message, index) => (
-            <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
+            <article
+              className={`message ${message.role} ${
+                message.kind === "swarm" ? "swarm-message" : ""
+              }`}
+              key={`${message.role}-${message.kind ?? "text"}-${index}`}
+            >
               <div className="message-header">
-                <div className="message-meta">{getRoleLabel(message.role)}</div>
+                <div className="message-meta">
+                  {message.kind === "swarm" ? "Execution Swarm" : getRoleLabel(message.role)}
+                </div>
               </div>
-              <p>{message.content}</p>
+              {message.kind === "swarm" && message.swarm ? (
+                <SwarmDiscussionPanel discussion={message.swarm} />
+              ) : (
+                <p>{message.content}</p>
+              )}
             </article>
           ))}
 
           {isLoading && (
             <article className="message assistant">
               <div className="message-meta">Agent</div>
+              {hasSwarmLogs && (
+                <SwarmDiscussionPanel
+                  activeActor={activeSwarmActor}
+                  discussion={{
+                    actors: swarmActors,
+                    logs: swarmActorLogs,
+                    status: swarmStatus || "Обсуждение решения"
+                  }}
+                />
+              )}
               {streamingContent ? (
-                <p>{streamingContent}</p>
+                <>
+                  {hasSwarmLogs && <div className="final-stream-label">Final answer</div>}
+                  <p>{streamingContent}</p>
+                </>
               ) : (
                 <p className="typing">
                   {agentPhase === "compressing"
                     ? "Сжимаю краткосрочную память..."
-                    : "Подключаю stream и вызываю LLM..."}
+                    : hasSwarmLogs
+                      ? "Integrator собирает финальный ответ..."
+                      : "Подключаю stream и вызываю LLM..."}
                 </p>
               )}
               {agentPhase === "memory" && (
@@ -1718,6 +2087,14 @@ function App() {
                 disabled={!canDisputeSolution}
               >
                 Оспорить
+              </button>
+              <button
+                className="danger"
+                type="button"
+                onClick={cancelTask}
+                disabled={!canCancelTask}
+              >
+                Отменить задачу
               </button>
             </div>
           </div>
@@ -1845,7 +2222,13 @@ function App() {
                 </div>
                 <div className="task-state-row">
                   <span>Статус</span>
-                  <strong>{taskState.isPaused ? "Пауза" : "Активно"}</strong>
+                  <strong>
+                    {taskState.isCancelled
+                      ? "Отменено"
+                      : taskState.isPaused
+                        ? "Пауза"
+                        : "Активно"}
+                  </strong>
                 </div>
                 <div className="task-state-row">
                   <span>Обновлено</span>
@@ -1865,7 +2248,7 @@ function App() {
                   <button
                     type="button"
                     onClick={taskState.isPaused ? resumeTask : pauseTask}
-                    disabled={isLoading}
+                    disabled={isLoading || taskState.isCancelled}
                   >
                     {taskState.isPaused ? "Продолжить" : "Пауза"}
                   </button>

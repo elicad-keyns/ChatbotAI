@@ -3,6 +3,14 @@ export type ChatRole = "user" | "assistant";
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+  kind?: "text" | "swarm";
+  swarm?: SwarmDiscussion;
+}
+
+export interface SwarmDiscussion {
+  actors: string[];
+  logs: Record<string, string>;
+  status: string;
 }
 
 export interface ShortTermSummary {
@@ -45,6 +53,7 @@ export type OrchestratorAction =
   | "approvePlan"
   | "approveSolution"
   | "disputeSolution"
+  | "cancelTask"
   | "debugTransition";
 
 export interface TaskState {
@@ -61,6 +70,7 @@ export interface TaskState {
   currentStep: string;
   expectedAction: string;
   isPaused: boolean;
+  isCancelled: boolean;
   updatedAt: string;
 }
 
@@ -145,8 +155,17 @@ export interface AgentRequest {
 export interface AgentStreamDelta {
   requestId: string;
   delta: string;
+  channel?: "final" | "swarm";
+  actor?: string;
 }
 
 export interface AgentMemoryStarted {
   requestId: string;
+}
+
+export interface AgentSwarmStatus {
+  requestId: string;
+  actors: string[];
+  activeActor?: string;
+  status: string;
 }
