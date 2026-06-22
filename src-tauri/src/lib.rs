@@ -1,4 +1,5 @@
 mod agent;
+mod mcp;
 
 use agent::{
     cancel_agent_request, clear_agent_request, Agent, AgentReply, AgentRequest, AgentStreamChunk,

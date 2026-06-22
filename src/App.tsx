@@ -175,6 +175,7 @@ interface AppSettings {
   shortTermCompressionEnabled: boolean;
   shortTermCompressionTurnLimit: number;
   orchestrationEnabled: boolean;
+  mcpEverythingEnabled: boolean;
   validatorInvariants: string;
   debugManualStateControls: boolean;
 }
@@ -222,6 +223,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   shortTermCompressionEnabled: true,
   shortTermCompressionTurnLimit: 10,
   orchestrationEnabled: false,
+  mcpEverythingEnabled: true,
   validatorInvariants: DEFAULT_VALIDATOR_INVARIANTS,
   debugManualStateControls: false
 };
@@ -497,6 +499,14 @@ function formatChatTime(value: string): string {
 function previewText(value: string, maxLength = 130): string {
   const compact = value.trim().replace(/\s+/g, " ");
   return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;
+}
+
+function formatJsonPreview(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function getRoleLabel(role: ChatMessage["role"]): string {
@@ -1567,6 +1577,9 @@ function App() {
             enabled: settings.orchestrationEnabled,
             action: orchestratorAction,
             validatorInvariants: settings.validatorInvariants
+          },
+          mcp: {
+            everythingEnabled: settings.mcpEverythingEnabled
           }
         }
       });
@@ -1918,6 +1931,12 @@ function App() {
           </span>
           <span>working: {memoryContext.working.length}</span>
           <span>long-term: {memoryContext.longTerm.length}</span>
+          <span>
+            MCP:{" "}
+            {settings.mcpEverythingEnabled
+              ? lastReply?.debug?.mcpStatus ?? "Everything on"
+              : "off"}
+          </span>
         </div>
 
         <div className="messages" aria-live="polite" ref={messagesRef}>
@@ -2141,6 +2160,12 @@ function App() {
               OpenAI memory-router классифицирует запрос коротким TOON-like
               ответом: рабочий контекст, долгосрочные предпочтения или пропуск.
             </p>
+            {settings.mcpEverythingEnabled && (
+              <p className="auto-memory-note">
+                Everything MCP is on. Ask what MCP tools are available, or call one directly:{" "}
+                <code>/mcp echo {"{\"message\":\"hello\"}"}</code>.
+              </p>
+            )}
           </div>
         </form>
       </section>
@@ -2602,8 +2627,52 @@ function App() {
                     <dt>chars</dt>
                     <dd>{lastReply.debug.memoryInstructionChars}</dd>
                   </div>
+                  <div>
+                    <dt>mcp</dt>
+                    <dd>{lastReply.debug.mcpEnabled ? lastReply.debug.mcpStatus : "off"}</dd>
+                  </div>
+                  <div>
+                    <dt>mcp tools</dt>
+                    <dd>{lastReply.debug.mcpToolCount}</dd>
+                  </div>
+                  <div>
+                    <dt>mcp call</dt>
+                    <dd>{lastReply.debug.mcpToolCall?.toolName ?? "none"}</dd>
+                  </div>
                 </dl>
                 <pre>{lastReply.debug.promptPreview}</pre>
+                <strong>Everything MCP tools</strong>
+                {lastReply.debug.mcpTools.length === 0 ? (
+                  <p className="muted-text">
+                    {lastReply.debug.mcpEnabled
+                      ? "No tools returned from Everything MCP."
+                      : "Everything MCP is disabled."}
+                  </p>
+                ) : (
+                  <div className="mcp-tool-list">
+                    {lastReply.debug.mcpTools.map((tool) => (
+                      <div className="mcp-tool-item" key={tool.name}>
+                        <b>{tool.name}</b>
+                        <p>{tool.description ?? "No description."}</p>
+                        <code>{formatJsonPreview(tool.inputSchema)}</code>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <strong>Everything MCP tool call</strong>
+                {lastReply.debug.mcpToolCall ? (
+                  <pre>
+                    {[
+                      `tool: ${lastReply.debug.mcpToolCall.toolName}`,
+                      `arguments: ${lastReply.debug.mcpToolCall.arguments}`,
+                      `isError: ${lastReply.debug.mcpToolCall.isError}`,
+                      "result:",
+                      lastReply.debug.mcpToolCall.result
+                    ].join("\n")}
+                  </pre>
+                ) : (
+                  <p className="muted-text">No MCP tool was called for the last message.</p>
+                )}
                 <strong>Short-term compression input</strong>
                 <pre>
                   {lastReply.debug.shortTermCompressionInput ||
@@ -2812,6 +2881,24 @@ function App() {
                     Если включено, этапами управляет backend-оркестратор: Planning Agent,
                     Execution Agent, Validation Agent и Done state. Если выключено,
                     работает старый обычный чат.
+                  </small>
+                </span>
+              </label>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={settings.mcpEverythingEnabled}
+                  onChange={(event) =>
+                    updateSettings({ mcpEverythingEnabled: event.target.checked })
+                  }
+                />
+                <span>
+                  <b>Everything MCP</b>
+                  <small>
+                    Connects to @modelcontextprotocol/server-everything, adds tools/list
+                    to the agent context, and supports direct calls like
+                    /mcp echo {"{\"message\":\"hello\"}"}.
                   </small>
                 </span>
               </label>

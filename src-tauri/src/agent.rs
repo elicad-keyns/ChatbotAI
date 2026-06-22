@@ -1,3 +1,6 @@
+use crate::mcp::{
+    build_mcp_instruction, prepare_everything_context, McpSettings, McpTool, McpToolCallInfo,
+};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -129,6 +132,8 @@ pub struct AgentRequest {
     pub short_term_compression: ShortTermCompressionSettings,
     #[serde(default)]
     pub orchestration: OrchestrationSettings,
+    #[serde(default)]
+    pub mcp: McpSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,6 +343,11 @@ pub struct MemoryDebugInfo {
     pub orchestrator_agent: String,
     pub orchestrator_action: String,
     pub validator_violations: Vec<String>,
+    pub mcp_enabled: bool,
+    pub mcp_status: String,
+    pub mcp_tool_count: usize,
+    pub mcp_tools: Vec<McpTool>,
+    pub mcp_tool_call: Option<McpToolCallInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,6 +367,7 @@ pub struct Agent {
     memory_context: MemoryContext,
     short_term_compression: ShortTermCompressionSettings,
     orchestration: OrchestrationSettings,
+    mcp: McpSettings,
     client: reqwest::Client,
 }
 
@@ -384,6 +395,7 @@ impl Agent {
             memory_context: request.memory_context.clone(),
             short_term_compression: request.short_term_compression.clone(),
             orchestration: request.orchestration.clone(),
+            mcp: request.mcp.clone(),
             client: reqwest::Client::new(),
         })
     }
@@ -425,12 +437,15 @@ impl Agent {
             .find(|message| normalize_role(&message.role) == "user")
             .map(|message| message.content.trim().to_owned())
             .unwrap_or_default();
+        let mcp_context = prepare_everything_context(&latest_user_message, &self.mcp).await;
+        let mcp_instruction = build_mcp_instruction(&mcp_context);
 
         let short_term_preparation = self.prepare_short_term_messages(&messages).await;
         let mut effective_memory_context = self.memory_context.clone();
         effective_memory_context.short_term = short_term_preparation.messages.clone();
         effective_memory_context.short_term_summary = short_term_preparation.summary.clone();
         let memory_instruction = build_memory_instruction(&effective_memory_context);
+        let context_instruction = combine_instructions(&memory_instruction, &mcp_instruction);
 
         let input = short_term_preparation
             .messages
@@ -453,7 +468,7 @@ impl Agent {
         });
         self.ensure_not_cancelled()?;
 
-        let instructions = combine_instructions(&self.system_prompt, &memory_instruction);
+        let instructions = combine_instructions(&self.system_prompt, &context_instruction);
         if !instructions.is_empty() {
             body["instructions"] = json!(instructions);
         }
@@ -531,8 +546,8 @@ impl Agent {
 
         let mut debug = build_memory_debug(&effective_memory_context, input_message_count, "");
         debug.input_message_count = input_message_count;
-        debug.memory_instruction_chars = memory_instruction.chars().count();
-        debug.prompt_preview = preview_text(&memory_instruction, 1200);
+        debug.memory_instruction_chars = context_instruction.chars().count();
+        debug.prompt_preview = preview_text(&context_instruction, 1600);
         debug.short_term_visible_message_count = messages.len();
         debug.short_term_input_message_count = input_message_count;
         debug.short_term_summary_chars = short_term_preparation
@@ -552,6 +567,11 @@ impl Agent {
             preview_text(&short_term_preparation.debug.raw_input, 3000);
         debug.short_term_compression_raw =
             preview_text(&short_term_preparation.debug.raw_output, 3000);
+        debug.mcp_enabled = mcp_context.enabled;
+        debug.mcp_status = mcp_context.status;
+        debug.mcp_tool_count = mcp_context.tools.len();
+        debug.mcp_tools = mcp_context.tools;
+        debug.mcp_tool_call = mcp_context.tool_call;
         on_memory_started();
         self.ensure_not_cancelled()?;
         let memory_router_result = self.classify_memory(&latest_user_message, &content).await;
@@ -845,6 +865,10 @@ impl Agent {
         debug.orchestrator_agent = active_agent;
         debug.orchestrator_action = action;
         debug.validator_violations = validator_violations;
+        debug.mcp_enabled = self.mcp.everything_enabled;
+        if self.mcp.everything_enabled {
+            debug.mcp_status = "not used in orchestration mode".to_owned();
+        }
 
         on_memory_started();
         self.ensure_not_cancelled()?;
@@ -2269,6 +2293,11 @@ fn build_memory_debug(
         orchestrator_agent: String::new(),
         orchestrator_action: String::new(),
         validator_violations: Vec::new(),
+        mcp_enabled: false,
+        mcp_status: "disabled".to_owned(),
+        mcp_tool_count: 0,
+        mcp_tools: Vec::new(),
+        mcp_tool_call: None,
     }
 }
 

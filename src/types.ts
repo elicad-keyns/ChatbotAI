@@ -80,6 +80,24 @@ export interface OrchestrationSettings {
   validatorInvariants: string;
 }
 
+export interface McpSettings {
+  everythingEnabled: boolean;
+}
+
+export interface McpTool {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
+export interface McpToolCallInfo {
+  toolName: string;
+  arguments: string;
+  result: string;
+  isError: boolean;
+}
+
 export interface MemoryContext {
   activeProfile?: UserProfile;
   shortTerm: ChatMessage[];
@@ -118,6 +136,11 @@ export interface MemoryDebugInfo {
   orchestratorAgent: string;
   orchestratorAction: string;
   validatorViolations: string[];
+  mcpEnabled: boolean;
+  mcpStatus: string;
+  mcpToolCount: number;
+  mcpTools: McpTool[];
+  mcpToolCall?: McpToolCallInfo;
 }
 
 export interface MemoryDecision {
@@ -150,6 +173,7 @@ export interface AgentRequest {
   memoryContext: MemoryContext;
   shortTermCompression: ShortTermCompressionSettings;
   orchestration?: OrchestrationSettings;
+  mcp?: McpSettings;
 }
 
 export interface AgentStreamDelta {

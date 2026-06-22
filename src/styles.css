@@ -2136,6 +2136,37 @@ button:hover .button-icon {
   overflow-wrap: anywhere;
 }
 
+.mcp-tool-list {
+  display: grid;
+  gap: 8px;
+}
+
+.mcp-tool-item {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 8px;
+  background: var(--muted-bg);
+}
+
+.mcp-tool-item b {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.mcp-tool-item p {
+  margin: 0;
+}
+
+.mcp-tool-item code {
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .debug-block pre {
   max-height: 220px;
   overflow: auto;
