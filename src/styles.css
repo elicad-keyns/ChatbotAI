@@ -1300,6 +1300,64 @@ button:hover .button-icon {
   color: var(--muted-text);
 }
 
+.mcp-execution-panel {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border-soft));
+  border-radius: 12px;
+  padding: 9px 10px;
+  background: color-mix(in srgb, var(--primary) 5%, var(--surface-bg));
+}
+
+.mcp-execution-title {
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.mcp-execution-step {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.mcp-execution-step small {
+  color: var(--muted-text);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.mcp-execution-indicator {
+  width: 9px;
+  height: 9px;
+  border: 2px solid color-mix(in srgb, var(--primary) 28%, transparent);
+  border-radius: 999px;
+}
+
+.mcp-execution-step.running .mcp-execution-indicator {
+  border-top-color: var(--primary);
+  animation: memory-spin 0.75s linear infinite;
+}
+
+.mcp-execution-step.completed .mcp-execution-indicator {
+  border-color: #35a46f;
+  background: #35a46f;
+  box-shadow: inset 0 0 0 2px var(--surface-bg);
+}
+
+.mcp-execution-step.failed .mcp-execution-indicator {
+  border-color: var(--danger-border);
+  background: var(--danger-border);
+}
+
 .memory-loader {
   display: inline-flex;
   align-items: center;

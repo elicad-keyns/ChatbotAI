@@ -21,8 +21,12 @@ const MEMORY_REASON_MAX_CHARS: usize = 180;
 const SHORT_TERM_SUMMARY_MODEL: &str = "gpt-4.1-mini";
 const SHORT_TERM_SUMMARY_MAX_OUTPUT_TOKENS: u16 = 700;
 const SHORT_TERM_SUMMARY_MAX_CHARS: usize = 3_500;
+const MAX_MCP_TOOL_STEPS: usize = 6;
 const MCP_TOOL_ROUTER_INSTRUCTIONS: &str = "You are the MCP tool router for an assistant. \
-Select at most one provided function when the conversation requires an external MCP action or read. \
+Select the next single provided function needed to fulfill the user's latest request. You may be \
+called repeatedly after each tool result, so continue a multi-tool pipeline by passing exact IDs \
+and values from prior results into the next tool. Stop selecting functions when the request is \
+fully satisfied or when a prior tool failed. Never repeat an identical function call. \
 Use the full conversation to recover parameters that were discussed in earlier turns. \
 For a write function whose schema contains a confirmed parameter, call it only when the latest user \
 message explicitly confirms the immediately preceding assistant confirmation request. \
@@ -177,6 +181,10 @@ impl AgentStreamChunk {
 
     fn swarm_delta(actor: &str, delta: &str) -> Self {
         Self::new("swarm", Some(actor), delta)
+    }
+
+    fn mcp_status(tool_name: &str, status: &str) -> Self {
+        Self::new("mcp", Some(tool_name), status)
     }
 }
 
@@ -355,6 +363,7 @@ pub struct MemoryDebugInfo {
     pub mcp_tool_count: usize,
     pub mcp_tools: Vec<McpTool>,
     pub mcp_tool_call: Option<McpToolCallInfo>,
+    pub mcp_tool_calls: Vec<McpToolCallInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,7 +424,14 @@ impl Agent {
         }
     }
 
-    async fn prepare_agentic_mcp_context(&self, messages: &[ChatMessage]) -> McpRuntimeContext {
+    async fn prepare_agentic_mcp_context<F>(
+        &self,
+        messages: &[ChatMessage],
+        on_delta: &mut F,
+    ) -> McpRuntimeContext
+    where
+        F: FnMut(AgentStreamChunk),
+    {
         let latest_user_message = messages
             .iter()
             .rev()
@@ -431,34 +447,68 @@ impl Agent {
             return context;
         }
 
-        let selected = match self.select_mcp_tool(messages, &context.tools).await {
-            Ok(selected) => selected,
-            Err(error) => {
-                context.status.push_str(&format!(
-                    "; automatic tool routing unavailable ({})",
-                    preview_text(&error, 240)
-                ));
-                return context;
-            }
-        };
-        let Some((tool, mut arguments)) = selected else {
-            return context;
-        };
+        let mut seen_calls = HashSet::new();
+        for _ in 0..MAX_MCP_TOOL_STEPS {
+            let selected = match self
+                .select_mcp_tool(messages, &context.tools, &context.tool_calls)
+                .await
+            {
+                Ok(selected) => selected,
+                Err(error) => {
+                    context.status.push_str(&format!(
+                        "; automatic tool routing unavailable ({})",
+                        preview_text(&error, 240)
+                    ));
+                    break;
+                }
+            };
+            let Some((tool, mut arguments)) = selected else {
+                break;
+            };
 
-        if tool_requires_confirmation(&tool) {
-            if !has_explicit_write_confirmation(messages) {
+            if tool_requires_confirmation(&tool) {
+                if !has_explicit_write_confirmation(messages) {
+                    context
+                        .status
+                        .push_str("; write tool is waiting for explicit user confirmation");
+                    break;
+                }
+                if let Some(arguments) = arguments.as_object_mut() {
+                    arguments.insert("confirmed".to_owned(), Value::Bool(true));
+                }
+            }
+
+            let call_signature = format!(
+                "{}:{}:{}",
+                tool.server_id,
+                tool.name,
+                serde_json::to_string(&arguments).unwrap_or_default()
+            );
+            if !seen_calls.insert(call_signature) {
                 context
                     .status
-                    .push_str("; write tool is waiting for explicit user confirmation");
-                return context;
+                    .push_str("; automatic pipeline stopped before a repeated tool call");
+                break;
             }
-            if let Some(arguments) = arguments.as_object_mut() {
-                arguments.insert("confirmed".to_owned(), Value::Bool(true));
+
+            on_delta(AgentStreamChunk::mcp_status(&tool.name, "running"));
+            let call = execute_mcp_tool(&self.mcp, &tool.server_id, &tool.name, arguments).await;
+            on_delta(AgentStreamChunk::mcp_status(
+                &tool.name,
+                if call.is_error { "failed" } else { "completed" },
+            ));
+            context.tool_call = Some(call.clone());
+            context.tool_calls.push(call);
+            if context.tool_call.as_ref().is_some_and(|call| call.is_error) {
+                break;
             }
         }
-
-        context.tool_call =
-            Some(execute_mcp_tool(&self.mcp, &tool.server_id, &tool.name, arguments).await);
+        if !context.tool_calls.is_empty() {
+            context.status.push_str(&format!(
+                "; automatic pipeline executed {} tool call(s)",
+                context.tool_calls.len()
+            ));
+        }
         context
     }
 
@@ -466,12 +516,13 @@ impl Agent {
         &self,
         messages: &[ChatMessage],
         tools: &[McpTool],
+        prior_calls: &[McpToolCallInfo],
     ) -> Result<Option<(McpTool, Value)>, String> {
         let bindings = build_mcp_function_bindings(tools);
         if bindings.is_empty() {
             return Ok(None);
         }
-        let input = messages
+        let mut input = messages
             .iter()
             .filter(|message| !message.content.trim().is_empty())
             .map(|message| {
@@ -481,6 +532,34 @@ impl Agent {
                 })
             })
             .collect::<Vec<_>>();
+        if !prior_calls.is_empty() {
+            let history = prior_calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    format!(
+                        "Step {}: tool={} arguments={} is_error={} result={}",
+                        index + 1,
+                        call.tool_name,
+                        call.arguments,
+                        call.is_error,
+                        preview_text(&call.result, 5000)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            input.push(json!({
+                "role": "user",
+                "content": format!(
+                    concat!(
+                        "MCP pipeline execution history follows. Select the next tool only if the ",
+                        "original user request still requires another step. Reuse exact IDs from ",
+                        "these results.\n{}"
+                    ),
+                    history
+                )
+            }));
+        }
         let function_tools = bindings
             .iter()
             .map(|binding| {
@@ -576,7 +655,9 @@ impl Agent {
             .find(|message| normalize_role(&message.role) == "user")
             .map(|message| message.content.trim().to_owned())
             .unwrap_or_default();
-        let mcp_context = self.prepare_agentic_mcp_context(&messages).await;
+        let mcp_context = self
+            .prepare_agentic_mcp_context(&messages, &mut on_delta)
+            .await;
         let mcp_instruction = build_mcp_instruction(&mcp_context);
 
         let short_term_preparation = self.prepare_short_term_messages(&messages).await;
@@ -711,6 +792,7 @@ impl Agent {
         debug.mcp_tool_count = mcp_context.tools.len();
         debug.mcp_tools = mcp_context.tools;
         debug.mcp_tool_call = mcp_context.tool_call;
+        debug.mcp_tool_calls = mcp_context.tool_calls;
         on_memory_started();
         self.ensure_not_cancelled()?;
         let memory_router_result = self.classify_memory(&latest_user_message, &content).await;
@@ -747,7 +829,9 @@ impl Agent {
             .find(|message| normalize_role(&message.role) == "user")
             .map(|message| message.content.trim().to_owned())
             .unwrap_or_default();
-        let mcp_context = self.prepare_agentic_mcp_context(&messages).await;
+        let mcp_context = self
+            .prepare_agentic_mcp_context(&messages, &mut on_delta)
+            .await;
         let mcp_instruction = build_mcp_instruction(&mcp_context);
         let short_term_preparation = self.prepare_short_term_messages(&messages).await;
         let mut effective_memory_context = self.memory_context.clone();
@@ -1035,6 +1119,7 @@ impl Agent {
         debug.mcp_tool_count = mcp_context.tools.len();
         debug.mcp_tools = mcp_context.tools;
         debug.mcp_tool_call = mcp_context.tool_call;
+        debug.mcp_tool_calls = mcp_context.tool_calls;
 
         on_memory_started();
         self.ensure_not_cancelled()?;
@@ -2475,6 +2560,7 @@ fn build_memory_debug(
         mcp_tool_count: 0,
         mcp_tools: Vec::new(),
         mcp_tool_call: None,
+        mcp_tool_calls: Vec::new(),
     }
 }
 

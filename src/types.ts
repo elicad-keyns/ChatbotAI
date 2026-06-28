@@ -5,6 +5,13 @@ export interface ChatMessage {
   content: string;
   kind?: "text" | "swarm";
   swarm?: SwarmDiscussion;
+  mcpSteps?: McpExecutionStep[];
+}
+
+export interface McpExecutionStep {
+  toolName: string;
+  label: string;
+  status: "running" | "completed" | "failed";
 }
 
 export interface SwarmDiscussion {
@@ -166,6 +173,7 @@ export interface MemoryDebugInfo {
   mcpToolCount: number;
   mcpTools: McpTool[];
   mcpToolCall?: McpToolCallInfo;
+  mcpToolCalls: McpToolCallInfo[];
 }
 
 export interface MemoryDecision {
@@ -204,7 +212,7 @@ export interface AgentRequest {
 export interface AgentStreamDelta {
   requestId: string;
   delta: string;
-  channel?: "final" | "swarm";
+  channel?: "final" | "swarm" | "mcp";
   actor?: string;
 }
 

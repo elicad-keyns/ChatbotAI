@@ -114,6 +114,7 @@ pub struct McpRuntimeContext {
     pub status: String,
     pub tools: Vec<McpTool>,
     pub tool_call: Option<McpToolCallInfo>,
+    pub tool_calls: Vec<McpToolCallInfo>,
 }
 
 impl McpRuntimeContext {
@@ -123,6 +124,7 @@ impl McpRuntimeContext {
             status: "disabled".to_owned(),
             tools: Vec::new(),
             tool_call: None,
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -818,6 +820,7 @@ pub async fn prepare_mcp_context(user_message: &str, settings: &McpSettings) -> 
         status: "connecting".to_owned(),
         tools: Vec::new(),
         tool_call: None,
+        tool_calls: Vec::new(),
     };
     let mut statuses = Vec::new();
     let mut sessions: Vec<(McpServerConfig, McpSession)> = Vec::new();
@@ -861,29 +864,29 @@ pub async fn prepare_mcp_context(user_message: &str, settings: &McpSettings) -> 
         {
             let server_id = config.id.clone();
             let server_name = display_server_name(config);
-            context.tool_call = Some(
-                match session
-                    .call_tool(&call_request.tool_name, call_request.arguments)
-                    .await
-                {
-                    Ok(result) => McpToolCallInfo {
-                        server_id,
-                        server_name,
-                        tool_name: call_request.tool_name,
-                        arguments: arguments_text,
-                        result: format_tool_result(&result),
-                        is_error: result.is_error,
-                    },
-                    Err(error) => McpToolCallInfo {
-                        server_id,
-                        server_name,
-                        tool_name: call_request.tool_name,
-                        arguments: arguments_text,
-                        result: error.to_string(),
-                        is_error: true,
-                    },
+            let call = match session
+                .call_tool(&call_request.tool_name, call_request.arguments)
+                .await
+            {
+                Ok(result) => McpToolCallInfo {
+                    server_id,
+                    server_name,
+                    tool_name: call_request.tool_name,
+                    arguments: arguments_text,
+                    result: format_tool_result(&result),
+                    is_error: result.is_error,
                 },
-            );
+                Err(error) => McpToolCallInfo {
+                    server_id,
+                    server_name,
+                    tool_name: call_request.tool_name,
+                    arguments: arguments_text,
+                    result: error.to_string(),
+                    is_error: true,
+                },
+            };
+            context.tool_call = Some(call.clone());
+            context.tool_calls.push(call);
         }
     }
 
@@ -997,21 +1000,26 @@ pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
         ));
     }
 
-    if let Some(call) = &context.tool_call {
-        sections.push(format!(
-            "mcp_tool_call_result:\n\
-             server: {} ({})\n\
-             tool: {}\n\
-             arguments: {}\n\
-             is_error: {}\n\
-             result:\n{}",
-            call.server_name,
-            call.server_id,
-            call.tool_name,
-            call.arguments,
-            call.is_error,
-            preview_text(&call.result, 6000)
-        ));
+    if !context.tool_calls.is_empty() {
+        let calls = context
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                format!(
+                    "step: {}\nserver: {} ({})\ntool: {}\narguments: {}\nis_error: {}\nresult:\n{}",
+                    index + 1,
+                    call.server_name,
+                    call.server_id,
+                    call.tool_name,
+                    call.arguments,
+                    call.is_error,
+                    preview_text(&call.result, 6000)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        sections.push(format!("mcp_tool_call_results:\n{calls}"));
     } else {
         sections.push(
             "mcp_tool_call_result: none. A direct call can use /mcp <serverId> <toolName> {jsonArgs}; if a tool name is unique, /mcp <toolName> {jsonArgs} also works."
@@ -1402,6 +1410,42 @@ mod tests {
         let result = parse_http_response(body, 1).expect("SSE result should be parsed");
 
         assert_eq!(result, json!({"tools": []}));
+    }
+
+    #[test]
+    fn instruction_contains_every_pipeline_tool_result() {
+        let calls = vec![
+            McpToolCallInfo {
+                server_id: "tracker".to_owned(),
+                server_name: "Tracker".to_owned(),
+                tool_name: "search_tracker_issues".to_owned(),
+                arguments: "{}".to_owned(),
+                result: "search_id=search-1".to_owned(),
+                is_error: false,
+            },
+            McpToolCallInfo {
+                server_id: "tracker".to_owned(),
+                server_name: "Tracker".to_owned(),
+                tool_name: "summarize_tracker_issues".to_owned(),
+                arguments: "{\"search_id\":\"search-1\"}".to_owned(),
+                result: "summary_id=summary-1".to_owned(),
+                is_error: false,
+            },
+        ];
+        let context = McpRuntimeContext {
+            enabled: true,
+            status: "connected".to_owned(),
+            tools: Vec::new(),
+            tool_call: calls.last().cloned(),
+            tool_calls: calls,
+        };
+
+        let instruction = build_mcp_instruction(&context);
+
+        assert!(instruction.contains("search_tracker_issues"));
+        assert!(instruction.contains("search_id=search-1"));
+        assert!(instruction.contains("summarize_tracker_issues"));
+        assert!(instruction.contains("summary_id=summary-1"));
     }
 
     #[test]

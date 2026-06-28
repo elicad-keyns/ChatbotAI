@@ -11,6 +11,7 @@ import type {
   MemoryItem,
   MemoryLayerId,
   McpConnectionTestResult,
+  McpExecutionStep,
   McpServerConfig,
   AgentStreamDelta,
   OrchestratorAction,
@@ -723,8 +724,74 @@ function normalizeChatMessage(message: Partial<ChatMessage>): ChatMessage | null
 
   return {
     role: message.role,
-    content: message.content
+    content: message.content,
+    mcpSteps: normalizeMcpExecutionSteps(message.mcpSteps)
   };
+}
+
+function getMcpToolLabel(toolName: string): string {
+  const labels: Record<string, string> = {
+    search_tracker_issues: "Ищу задачи в Yandex Tracker",
+    summarize_tracker_issues: "Формирую сводку по задачам",
+    save_tracker_report: "Сохраняю и отправляю отчёт",
+    create_issue: "Создаю задачу в Yandex Tracker",
+    update_issue: "Обновляю задачу в Yandex Tracker",
+    search_issues: "Ищу задачи в Yandex Tracker",
+    schedule_tracker_report: "Создаю расписание отчёта"
+  };
+  return labels[toolName] ?? `Вызываю инструмент ${toolName}`;
+}
+
+function normalizeMcpExecutionSteps(value: unknown): McpExecutionStep[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const steps = value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+    const raw = entry as Partial<McpExecutionStep>;
+    if (
+      typeof raw.toolName !== "string" ||
+      !["running", "completed", "failed"].includes(raw.status ?? "")
+    ) {
+      return [];
+    }
+    return [{
+      toolName: raw.toolName,
+      label: typeof raw.label === "string" && raw.label.trim()
+        ? raw.label
+        : getMcpToolLabel(raw.toolName),
+      status: raw.status as McpExecutionStep["status"]
+    }];
+  });
+  return steps.length > 0 ? steps : undefined;
+}
+
+function updateMcpExecutionSteps(
+  current: McpExecutionStep[],
+  toolName: string,
+  status: McpExecutionStep["status"]
+): McpExecutionStep[] {
+  if (status === "running") {
+    return [
+      ...current,
+      { toolName, label: getMcpToolLabel(toolName), status }
+    ];
+  }
+  let index = -1;
+  for (let stepIndex = current.length - 1; stepIndex >= 0; stepIndex -= 1) {
+    if (current[stepIndex].toolName === toolName && current[stepIndex].status === "running") {
+      index = stepIndex;
+      break;
+    }
+  }
+  if (index < 0) {
+    return [...current, { toolName, label: getMcpToolLabel(toolName), status }];
+  }
+  return current.map((step, stepIndex) =>
+    stepIndex === index ? { ...step, status } : step
+  );
 }
 
 function SwarmDiscussionPanel({
@@ -753,6 +820,30 @@ function SwarmDiscussionPanel({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function McpExecutionPanel({ steps }: { steps: McpExecutionStep[] }) {
+  if (steps.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mcp-execution-panel" role="status" aria-live="polite">
+      <div className="mcp-execution-title">MCP pipeline</div>
+      {steps.map((step, index) => (
+        <div className={`mcp-execution-step ${step.status}`} key={`${step.toolName}-${index}`}>
+          <span className="mcp-execution-indicator" aria-hidden="true" />
+          <span>{step.label}</span>
+          <small>
+            {step.status === "running"
+              ? "выполняется"
+              : step.status === "completed"
+                ? "готово"
+                : "ошибка"}
+          </small>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1016,6 +1107,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>("idle");
   const [streamingContent, setStreamingContent] = useState("");
+  const [mcpExecutionSteps, setMcpExecutionSteps] = useState<McpExecutionStep[]>([]);
   const [swarmActors, setSwarmActors] = useState<string[]>([]);
   const [activeSwarmActor, setActiveSwarmActor] = useState<string | null>(null);
   const [swarmStatus, setSwarmStatus] = useState("");
@@ -1183,6 +1275,7 @@ function App() {
     activeChatId,
     messages.length,
     streamingContent,
+    mcpExecutionSteps,
     swarmActorLogs,
     agentPhase,
     isLoading,
@@ -1709,6 +1802,7 @@ function App() {
     let requestSwarmActors: string[] = [];
     let requestSwarmStatus = "";
     const requestSwarmLogs: Record<string, string> = {};
+    let requestMcpSteps: McpExecutionStep[] = [];
     const previousMessages = activeChat.messages;
     const requestTaskState = taskState;
     const optimisticTaskState = settings.orchestrationEnabled
@@ -1739,6 +1833,7 @@ function App() {
     }
     setAgentPhase(shouldCompressShortTerm(nextMessages, settings) ? "compressing" : "streaming");
     setStreamingContent("");
+    setMcpExecutionSteps([]);
     setSwarmActors([]);
     setActiveSwarmActor(null);
     setSwarmStatus("");
@@ -1756,6 +1851,17 @@ function App() {
             event.payload.requestId !== requestId ||
             cancelledRequestIdsRef.current.has(requestId)
           ) {
+            return;
+          }
+
+          if (event.payload.channel === "mcp") {
+            const toolName = event.payload.actor ?? "mcp_tool";
+            const status = ["running", "completed", "failed"].includes(event.payload.delta)
+              ? event.payload.delta as McpExecutionStep["status"]
+              : "running";
+            requestMcpSteps = updateMcpExecutionSteps(requestMcpSteps, toolName, status);
+            setMcpExecutionSteps(requestMcpSteps);
+            setAgentPhase("streaming");
             return;
           }
 
@@ -1844,7 +1950,17 @@ function App() {
       const completedMessages: ChatMessage[] = [
         ...nextMessages,
         ...(swarmMessage ? [swarmMessage] : []),
-        { role: "assistant", content: reply.content }
+        {
+          role: "assistant",
+          content: reply.content,
+          mcpSteps: requestMcpSteps.length > 0
+            ? requestMcpSteps
+            : reply.debug?.mcpToolCalls?.map((call) => ({
+                toolName: call.toolName,
+                label: getMcpToolLabel(call.toolName),
+                status: call.isError ? "failed" as const : "completed" as const
+              }))
+        }
       ];
       const nextShortTermSummary = reply.shortTermSummary
         ? {
@@ -1863,6 +1979,7 @@ function App() {
         ...applyMemoryDecisions(reply.memoryDecisions, text, activeChat.id)
       ]);
       setStreamingContent("");
+      setMcpExecutionSteps([]);
     } catch (caughtError) {
       if (
         cancelledRequestIdsRef.current.has(requestId) ||
@@ -1879,6 +1996,7 @@ function App() {
         setTaskState(requestTaskState);
       }
       setStreamingContent("");
+      setMcpExecutionSteps([]);
     } finally {
       unlistenStream?.();
       unlistenMemory?.();
@@ -1888,6 +2006,7 @@ function App() {
         activeRequestIdRef.current = null;
         setIsLoading(false);
         setAgentPhase("idle");
+        setMcpExecutionSteps([]);
         inputRef.current?.focus();
       }
     }
@@ -2271,7 +2390,12 @@ function App() {
               {message.kind === "swarm" && message.swarm ? (
                 <SwarmDiscussionPanel discussion={message.swarm} />
               ) : (
-                <p>{message.content}</p>
+                <>
+                  <p>{message.content}</p>
+                  {message.mcpSteps && message.mcpSteps.length > 0 && (
+                    <McpExecutionPanel steps={message.mcpSteps} />
+                  )}
+                </>
               )}
             </article>
           ))}
@@ -2302,6 +2426,9 @@ function App() {
                       ? "Integrator собирает финальный ответ..."
                       : "Подключаю stream и вызываю LLM..."}
                 </p>
+              )}
+              {mcpExecutionSteps.length > 0 && (
+                <McpExecutionPanel steps={mcpExecutionSteps} />
               )}
               {agentPhase === "memory" && (
                 <div className="memory-loader" role="status" aria-live="polite">
