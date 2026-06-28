@@ -1335,6 +1335,11 @@ button:hover .button-icon {
   font-weight: 800;
 }
 
+.mcp-execution-step > span b {
+  color: var(--primary);
+  font-size: 11px;
+}
+
 .mcp-execution-indicator {
   width: 9px;
   height: 9px;

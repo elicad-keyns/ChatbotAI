@@ -9,6 +9,7 @@ export interface ChatMessage {
 }
 
 export interface McpExecutionStep {
+  serverName: string;
   toolName: string;
   label: string;
   status: "running" | "completed" | "failed";
@@ -214,6 +215,7 @@ export interface AgentStreamDelta {
   delta: string;
   channel?: "final" | "swarm" | "mcp";
   actor?: string;
+  serverName?: string;
 }
 
 export interface AgentMemoryStarted {

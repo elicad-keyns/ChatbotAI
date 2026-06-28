@@ -1,0 +1,119 @@
+[06/29/26 01:04:17] INFO     Starting Yandex Tracker MCP:         server.py:760
+                             host=127.0.0.1 port=18788                         
+                             public_url=http://127.0.0.1:18788                 
+                             backend=yandex                                    
+                             scheduler_timezone=Europe/Moscow                  
+                             bot_service_url=http://127.0.0.1:187              
+                             91                                                
+INFO:     Started server process [12948]
+INFO:     Waiting for application startup.
+                    INFO     MCP application startup:             server.py:199
+                             initializing scheduler and                        
+                             composition pipeline                              
+                    INFO     Starting scheduler:               scheduler.py:376
+                             database=C:\Users\elica\OneDrive\                 
+                             Desktop\ChatbotAI\.agents\day20-e                 
+                             2e-de65600c761d454bbcd1f9fd8e41c8                 
+                             e1\tracker.db                                     
+                             timezone=Europe/Moscow                            
+                             bot_service_configured=True                       
+                    INFO     Scheduler started                      base.py:214
+                    INFO     Scheduler database initialized:   scheduler.py:385
+                             persisted_jobs=0                                  
+                    INFO     Scheduler ready: active_jobs=0    scheduler.py:401
+[06/29/26 01:04:18] INFO     MCP composition pipeline ready:    pipeline.py:285
+                             database=C:\Users\elica\OneDrive\D                
+                             esktop\ChatbotAI\.agents\day20-e2e                
+                             -de65600c761d454bbcd1f9fd8e41c8e1\                
+                             tracker.db                                        
+                             reports_directory=C:\Users\elica\O                
+                             neDrive\Desktop\ChatbotAI\.agents\                
+                             day20-e2e-de65600c761d454bbcd1f9fd                
+                             8e41c8e1\reports                                  
+                    INFO     MCP application startup complete     server.py:206
+                    INFO     StreamableHTTP      streamable_http_manager.py:131
+                             session manager                                   
+                             started                                           
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18788 (Press CTRL+C to quit)
+[06/29/26 01:04:20] INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             CallToolRequest                                   
+                    INFO     Yandex Tracker API request started: tracker.py:209
+                             method=POST path=/issues/_search                  
+                             param_keys=['fields', 'perPage']                  
+                             body_keys=['filter', 'order']                     
+                             query=None filter={'queue': 'AI'}                 
+[06/29/26 01:04:22] INFO     HTTP Request: POST                 _client.py:1740
+                             https://api.tracker.yandex.net/v3/                
+                             issues/_search?perPage=100&fields=                
+                             id%2Ckey%2Csummary%2Cstatus%2Cprio                
+                             rity%2Cassignee%2Cdeadline%2CdueDa                
+                             te%2CupdatedAt%2CcreatedAt%2Cqueue                
+                             %2Ctags "HTTP/1.1 200 OK"                         
+                    INFO     Yandex Tracker API request          tracker.py:259
+                             succeeded: method=POST                            
+                             path=/issues/_search                              
+                             http_status=200 duration_ms=1422                  
+                             result_count=8                                    
+                    INFO     Pipeline search saved:             pipeline.py:333
+                             search_id=09123ca231384e21913f7fc5                
+                             b7cd2a76 queue=AI                                 
+                             filters={'open_only': True,                       
+                             'critical_only': True} issues=5                   
+                             duration_ms=1500                                  
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             ListToolsRequest                                  
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             CallToolRequest                                   
+                    INFO     Pipeline summary saved:            pipeline.py:349
+                             summary_id=5d5ca00f4108471e8ea7c4f                
+                             b603d7448                                         
+                             search_id=09123ca231384e21913f7fc5                
+                             b7cd2a76 total=5                                  
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             ListToolsRequest                                  
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             CallToolRequest                                   
+                    INFO     Pipeline report file saved:        pipeline.py:372
+                             artifact_id=e7bf8d0517b944aba1d7a2                
+                             985554b0a6                                        
+                             summary_id=5d5ca00f4108471e8ea7c4f                
+                             b603d7448                                         
+                             path=C:\Users\elica\OneDrive\Deskt                
+                             op\ChatbotAI\.agents\day20-e2e-de6                
+                             5600c761d454bbcd1f9fd8e41c8e1\repo                
+                             rts\2026-06-28\day-20-multi-server                
+                             -report-e7bf8d05.md                               
+                             size_bytes=1904                                   
+                    INFO     Pipeline artifact completed:       pipeline.py:403
+                             artifact_id=e7bf8d0517b944aba1d7a2                
+                             985554b0a6                                        
+                             telegram_status=not_requested                     
+                             delivered_chats=0 error=None                      
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             ListToolsRequest                                  
+                    INFO     Terminating session: None   streamable_http.py:788
+[06/29/26 01:04:23] INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             CallToolRequest                                   
+                    INFO     Pipeline artifact loaded:          pipeline.py:428
+                             artifact_id=e7bf8d0517b944aba1d7a2                
+                             985554b0a6                                        
+                             filename=day-20-multi-server-repor                
+                             t-e7bf8d05.md size_bytes=1904                     
+                    INFO     Terminating session: None   streamable_http.py:788
+                    INFO     Processing request of type           server.py:733
+                             ListToolsRequest                                  
+                    INFO     Terminating session: None   streamable_http.py:788

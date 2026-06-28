@@ -27,6 +27,9 @@ Select the next single provided function needed to fulfill the user's latest req
 called repeatedly after each tool result, so continue a multi-tool pipeline by passing exact IDs \
 and values from prior results into the next tool. Stop selecting functions when the request is \
 fully satisfied or when a prior tool failed. Never repeat an identical function call. \
+Tools may belong to different MCP servers: follow each tool's next-step description and switch \
+servers when required. If the user asked to save, send, and verify a report, do not stop after \
+saving; continue through delivery and status verification using the returned IDs. \
 Use the full conversation to recover parameters that were discussed in earlier turns. \
 For a write function whose schema contains a confirmed parameter, call it only when the latest user \
 message explicitly confirms the immediately preceding assistant confirmation request. \
@@ -164,6 +167,7 @@ pub struct AgentStreamChunk {
     pub delta: String,
     pub channel: String,
     pub actor: Option<String>,
+    pub server_name: Option<String>,
 }
 
 impl AgentStreamChunk {
@@ -172,6 +176,7 @@ impl AgentStreamChunk {
             delta: delta.to_owned(),
             channel: channel.to_owned(),
             actor: actor.map(str::to_owned),
+            server_name: None,
         }
     }
 
@@ -183,8 +188,10 @@ impl AgentStreamChunk {
         Self::new("swarm", Some(actor), delta)
     }
 
-    fn mcp_status(tool_name: &str, status: &str) -> Self {
-        Self::new("mcp", Some(tool_name), status)
+    fn mcp_status(server_name: &str, tool_name: &str, status: &str) -> Self {
+        let mut chunk = Self::new("mcp", Some(tool_name), status);
+        chunk.server_name = Some(server_name.to_owned());
+        chunk
     }
 }
 
@@ -491,9 +498,14 @@ impl Agent {
                 break;
             }
 
-            on_delta(AgentStreamChunk::mcp_status(&tool.name, "running"));
+            on_delta(AgentStreamChunk::mcp_status(
+                &tool.server_name,
+                &tool.name,
+                "running",
+            ));
             let call = execute_mcp_tool(&self.mcp, &tool.server_id, &tool.name, arguments).await;
             on_delta(AgentStreamChunk::mcp_status(
+                &tool.server_name,
                 &tool.name,
                 if call.is_error { "failed" } else { "completed" },
             ));

@@ -733,7 +733,10 @@ function getMcpToolLabel(toolName: string): string {
   const labels: Record<string, string> = {
     search_tracker_issues: "Ищу задачи в Yandex Tracker",
     summarize_tracker_issues: "Формирую сводку по задачам",
-    save_tracker_report: "Сохраняю и отправляю отчёт",
+    save_tracker_report: "Сохраняю Markdown-отчёт",
+    send_tracker_artifact: "Отправляю отчёт в Telegram",
+    get_delivery_status: "Проверяю доставку в Telegram",
+    get_telegram_service_status: "Проверяю готовность Telegram-бота",
     create_issue: "Создаю задачу в Yandex Tracker",
     update_issue: "Обновляю задачу в Yandex Tracker",
     search_issues: "Ищу задачи в Yandex Tracker",
@@ -758,6 +761,9 @@ function normalizeMcpExecutionSteps(value: unknown): McpExecutionStep[] | undefi
       return [];
     }
     return [{
+      serverName: typeof raw.serverName === "string" && raw.serverName.trim()
+        ? raw.serverName
+        : "MCP",
       toolName: raw.toolName,
       label: typeof raw.label === "string" && raw.label.trim()
         ? raw.label
@@ -770,13 +776,14 @@ function normalizeMcpExecutionSteps(value: unknown): McpExecutionStep[] | undefi
 
 function updateMcpExecutionSteps(
   current: McpExecutionStep[],
+  serverName: string,
   toolName: string,
   status: McpExecutionStep["status"]
 ): McpExecutionStep[] {
   if (status === "running") {
     return [
       ...current,
-      { toolName, label: getMcpToolLabel(toolName), status }
+      { serverName, toolName, label: getMcpToolLabel(toolName), status }
     ];
   }
   let index = -1;
@@ -787,7 +794,10 @@ function updateMcpExecutionSteps(
     }
   }
   if (index < 0) {
-    return [...current, { toolName, label: getMcpToolLabel(toolName), status }];
+    return [
+      ...current,
+      { serverName, toolName, label: getMcpToolLabel(toolName), status }
+    ];
   }
   return current.map((step, stepIndex) =>
     stepIndex === index ? { ...step, status } : step
@@ -834,7 +844,9 @@ function McpExecutionPanel({ steps }: { steps: McpExecutionStep[] }) {
       {steps.map((step, index) => (
         <div className={`mcp-execution-step ${step.status}`} key={`${step.toolName}-${index}`}>
           <span className="mcp-execution-indicator" aria-hidden="true" />
-          <span>{step.label}</span>
+          <span>
+            <b>{step.serverName}</b> · {step.label}
+          </span>
           <small>
             {step.status === "running"
               ? "выполняется"
@@ -1391,6 +1403,32 @@ function App() {
     });
   }
 
+  function addTelegramDeliveryMcpServer() {
+    setSettings((current) => {
+      let suffix = 1;
+      let id = "telegram-delivery";
+      while (current.mcpServers.some((server) => server.id === id)) {
+        suffix += 1;
+        id = `telegram-delivery-${suffix}`;
+      }
+
+      return {
+        ...current,
+        mcpServers: [
+          ...current.mcpServers,
+          {
+            ...createMcpServer(current.mcpServers.length + 1, "streamableHttp"),
+            id,
+            name: "Telegram Delivery",
+            enabled: false,
+            url: "http://127.0.0.1:8792/mcp",
+            headers: { Authorization: "Bearer change-me" }
+          }
+        ]
+      };
+    });
+  }
+
   function removeMcpServer(serverId: string) {
     setSettings((current) => ({
       ...current,
@@ -1856,10 +1894,16 @@ function App() {
 
           if (event.payload.channel === "mcp") {
             const toolName = event.payload.actor ?? "mcp_tool";
+            const serverName = event.payload.serverName ?? "MCP";
             const status = ["running", "completed", "failed"].includes(event.payload.delta)
               ? event.payload.delta as McpExecutionStep["status"]
               : "running";
-            requestMcpSteps = updateMcpExecutionSteps(requestMcpSteps, toolName, status);
+            requestMcpSteps = updateMcpExecutionSteps(
+              requestMcpSteps,
+              serverName,
+              toolName,
+              status
+            );
             setMcpExecutionSteps(requestMcpSteps);
             setAgentPhase("streaming");
             return;
@@ -1954,8 +1998,9 @@ function App() {
           role: "assistant",
           content: reply.content,
           mcpSteps: requestMcpSteps.length > 0
-            ? requestMcpSteps
+              ? requestMcpSteps
             : reply.debug?.mcpToolCalls?.map((call) => ({
+                serverName: call.serverName,
                 toolName: call.toolName,
                 label: getMcpToolLabel(call.toolName),
                 status: call.isError ? "failed" as const : "completed" as const
@@ -3281,6 +3326,13 @@ function App() {
                     >
                       + Tracker
                     </button>
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={addTelegramDeliveryMcpServer}
+                    >
+                      + Telegram MCP
+                    </button>
                     <button className="ghost-button" type="button" onClick={addFigmaMcpServer}>
                       + Figma
                     </button>
@@ -3525,6 +3577,14 @@ function App() {
                                   Укажите URL развёрнутого YandexTrackerMCP и замените
                                   <code> Bearer change-me</code> на ваш MCP_API_KEY. Затем
                                   включите сервер и нажмите «Проверить».
+                                </p>
+                              )}
+                              {server.name === "Telegram Delivery" && (
+                                <p className="mcp-oauth-note">
+                                  Второй MCP-сервер для Day 20. Укажите URL
+                                  YandexTrackerTelegramMCP и его отдельный
+                                  <code> MCP_API_KEY</code>. Для длинного флоу включите
+                                  одновременно Tracker и Telegram Delivery.
                                 </p>
                               )}
                             </>

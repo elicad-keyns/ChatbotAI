@@ -16,6 +16,7 @@ struct AgentStreamDelta {
     delta: String,
     channel: String,
     actor: Option<String>,
+    server_name: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -57,6 +58,7 @@ async fn send_agent_message(
                         delta: chunk.delta,
                         channel: chunk.channel,
                         actor: chunk.actor,
+                        server_name: chunk.server_name,
                     },
                 );
             },

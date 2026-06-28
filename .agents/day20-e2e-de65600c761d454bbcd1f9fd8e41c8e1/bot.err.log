@@ -1,0 +1,14 @@
+INFO:     Started server process [14648]
+INFO:     Waiting for application startup.
+2026-06-29 01:04:17,809 INFO __main__ Starting Telegram bot: backend=mock database=C:\Users\elica\OneDrive\Desktop\ChatbotAI\.agents\day20-e2e-de65600c761d454bbcd1f9fd8e41c8e1\bot.db allowed_users=1 allow_all=True
+2026-06-29 01:04:17,821 INFO __main__ Telegram database initialized: active_subscribers=1
+2026-06-29 01:04:17,823 INFO __main__ Telegram authorization succeeded: bot_id=1 username=mock_tracker_bot
+2026-06-29 01:04:17,827 INFO __main__ Telegram webhook disabled; starting long polling
+2026-06-29 01:04:17,830 INFO __main__ Telegram long polling started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:18791 (Press CTRL+C to quit)
+2026-06-29 01:04:23,378 INFO __main__ POST /notify-document accepted: artifact_id=e7bf8d0517b944aba1d7a2985554b0a6 summary_id=5d5ca00f4108471e8ea7c4fb603d7448 filename=day-20-multi-server-report-e7bf8d05.md size_bytes=1904
+2026-06-29 01:04:23,395 INFO __main__ Document received and saved: artifact_id=e7bf8d0517b944aba1d7a2985554b0a6 summary_id=5d5ca00f4108471e8ea7c4fb603d7448 filename=day-20-multi-server-report-e7bf8d05.md size_bytes=1904 active_subscribers=1 chat_ids=[42]
+2026-06-29 01:04:23,395 INFO __main__ Document delivered: artifact_id=e7bf8d0517b944aba1d7a2985554b0a6 chat_id=42 filename=day-20-multi-server-report-e7bf8d05.md
+2026-06-29 01:04:23,396 INFO __main__ Document delivery finished: artifact_id=e7bf8d0517b944aba1d7a2985554b0a6 status=delivered delivered=1 failed=0
+2026-06-29 01:04:23,397 INFO __main__ POST /notify-document completed: artifact_id=e7bf8d0517b944aba1d7a2985554b0a6 status=delivered delivered=1 failed=0 error=None

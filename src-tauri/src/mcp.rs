@@ -1449,6 +1449,76 @@ mod tests {
     }
 
     #[test]
+    fn instruction_preserves_cross_server_pipeline_order() {
+        let sequence = [
+            (
+                "tracker",
+                "Yandex Tracker",
+                "search_tracker_issues",
+                "search_id=s1",
+            ),
+            (
+                "tracker",
+                "Yandex Tracker",
+                "summarize_tracker_issues",
+                "summary_id=s2",
+            ),
+            (
+                "tracker",
+                "Yandex Tracker",
+                "save_tracker_report",
+                "artifact_id=a3",
+            ),
+            (
+                "telegram",
+                "Telegram Delivery",
+                "send_tracker_artifact",
+                "delivery_id=d4",
+            ),
+            (
+                "telegram",
+                "Telegram Delivery",
+                "get_delivery_status",
+                "status=delivered",
+            ),
+        ];
+        let calls = sequence
+            .iter()
+            .map(
+                |(server_id, server_name, tool_name, result)| McpToolCallInfo {
+                    server_id: (*server_id).to_owned(),
+                    server_name: (*server_name).to_owned(),
+                    tool_name: (*tool_name).to_owned(),
+                    arguments: "{}".to_owned(),
+                    result: (*result).to_owned(),
+                    is_error: false,
+                },
+            )
+            .collect::<Vec<_>>();
+        let context = McpRuntimeContext {
+            enabled: true,
+            status: "2/2 connected".to_owned(),
+            tools: Vec::new(),
+            tool_call: calls.last().cloned(),
+            tool_calls: calls,
+        };
+
+        let instruction = build_mcp_instruction(&context);
+        let positions = sequence
+            .iter()
+            .map(|(_, _, tool_name, _)| {
+                instruction
+                    .find(tool_name)
+                    .unwrap_or_else(|| panic!("missing tool {tool_name}"))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(positions.windows(2).all(|window| window[0] < window[1]));
+        assert!(instruction.contains("Yandex Tracker"));
+        assert!(instruction.contains("Telegram Delivery"));
+    }
+
+    #[test]
     #[ignore = "requires npm install and the local Everything MCP package"]
     fn everything_server_connects_and_lists_tools() {
         let result = tauri::async_runtime::block_on(test_mcp_server(default_everything_server()));
