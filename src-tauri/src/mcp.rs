@@ -1,12 +1,7 @@
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{
-    env,
-    error::Error,
-    fmt,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{collections::BTreeMap, error::Error, fmt, process::Stdio};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -17,24 +12,72 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const EVERYTHING_PACKAGE: &str = "@modelcontextprotocol/server-everything";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpSettings {
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+    // Backward compatibility with settings saved before multi-server support.
     #[serde(default)]
     pub everything_enabled: bool,
 }
 
-impl Default for McpSettings {
-    fn default() -> Self {
-        Self {
-            everything_enabled: false,
+impl McpSettings {
+    pub fn enabled_servers(&self) -> Vec<McpServerConfig> {
+        if !self.servers.is_empty() {
+            return self
+                .servers
+                .iter()
+                .filter(|server| server.enabled)
+                .cloned()
+                .collect();
         }
+
+        self.everything_enabled
+            .then(default_everything_server)
+            .into_iter()
+            .collect()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpTool {
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default)]
+    pub server_name: String,
     pub name: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -47,10 +90,22 @@ pub struct McpTool {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolCallInfo {
+    pub server_id: String,
+    pub server_name: String,
     pub tool_name: String,
     pub arguments: String,
     pub result: String,
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectionTestResult {
+    pub server_id: String,
+    pub server_name: String,
+    pub connected: bool,
+    pub status: String,
+    pub tools: Vec<McpTool>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +134,7 @@ enum McpError {
     Io(String),
     Json(String),
     Timeout(String),
+    Http(String),
 }
 
 impl fmt::Display for McpError {
@@ -88,7 +144,8 @@ impl fmt::Display for McpError {
             | McpError::Protocol(message)
             | McpError::Io(message)
             | McpError::Json(message)
-            | McpError::Timeout(message) => write!(formatter, "{message}"),
+            | McpError::Timeout(message)
+            | McpError::Http(message) => write!(formatter, "{message}"),
         }
     }
 }
@@ -160,11 +217,13 @@ struct ToolContent {
 }
 
 struct McpToolCallRequest {
+    server_id: String,
     tool_name: String,
     arguments: Value,
 }
 
 struct McpStdioSession {
+    server_name: String,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -172,28 +231,43 @@ struct McpStdioSession {
 }
 
 impl McpStdioSession {
-    async fn connect() -> Result<Self, McpError> {
-        let mut command = everything_command();
+    async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        let mut command = configured_command(config)?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| McpError::Start(format!("failed to start Everything MCP: {error}")))?;
+        if let Some(cwd) = config
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            command.current_dir(cwd);
+        }
+        command.envs(&config.env);
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::Start("Everything MCP stdin is unavailable.".to_owned()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::Start("Everything MCP stdout is unavailable.".to_owned()))?;
+        let mut child = command.spawn().map_err(|error| {
+            McpError::Start(format!(
+                "failed to start MCP server '{}': {error}",
+                config.name
+            ))
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            McpError::Start(format!("MCP server '{}' stdin is unavailable", config.name))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            McpError::Start(format!(
+                "MCP server '{}' stdout is unavailable",
+                config.name
+            ))
+        })?;
 
         let mut session = Self {
+            server_name: display_server_name(config),
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -211,7 +285,7 @@ impl McpStdioSession {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "chatbot-ai-desktop",
-                    "version": "0.1.0"
+                    "version": "0.2.0"
                 }
             }),
         )
@@ -243,7 +317,11 @@ impl McpStdioSession {
         Ok(tools)
     }
 
-    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolCallResult, McpError> {
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallResult, McpError> {
         let result = self
             .request(
                 "tools/call",
@@ -296,12 +374,18 @@ impl McpStdioSession {
             let mut line = String::new();
             let bytes_read = timeout(REQUEST_TIMEOUT, self.stdout.read_line(&mut line))
                 .await
-                .map_err(|_| McpError::Timeout(format!("MCP request {id} timed out.")))??;
+                .map_err(|_| {
+                    McpError::Timeout(format!(
+                        "MCP server '{}' request {id} timed out",
+                        self.server_name
+                    ))
+                })??;
 
             if bytes_read == 0 {
-                return Err(McpError::Protocol(
-                    "Everything MCP closed stdout before responding.".to_owned(),
-                ));
+                return Err(McpError::Protocol(format!(
+                    "MCP server '{}' closed stdout before responding",
+                    self.server_name
+                )));
             }
 
             let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
@@ -331,11 +415,14 @@ impl McpStdioSession {
 
             return response
                 .result
-                .ok_or_else(|| McpError::Protocol("MCP response has no result.".to_owned()));
+                .ok_or_else(|| McpError::Protocol("MCP response has no result".to_owned()));
         }
     }
 
-    async fn reply_client_feature_not_implemented(&mut self, request: &Value) -> Result<(), McpError> {
+    async fn reply_client_feature_not_implemented(
+        &mut self,
+        request: &Value,
+    ) -> Result<(), McpError> {
         let Some(id) = request.get("id").cloned() else {
             return Ok(());
         };
@@ -363,68 +450,506 @@ impl McpStdioSession {
     }
 }
 
-pub async fn prepare_everything_context(
-    user_message: &str,
-    settings: &McpSettings,
-) -> McpRuntimeContext {
-    if !settings.everything_enabled {
+struct McpHttpSession {
+    server_name: String,
+    client: reqwest::Client,
+    url: String,
+    headers: HeaderMap,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+impl McpHttpSession {
+    async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        let url = config
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                McpError::Start(format!(
+                    "remote MCP server '{}' has an empty URL",
+                    display_server_name(config)
+                ))
+            })?;
+        reqwest::Url::parse(url)
+            .map_err(|error| McpError::Start(format!("invalid MCP URL: {error}")))?;
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in &config.headers {
+            let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
+                McpError::Start(format!("invalid HTTP header name '{name}': {error}"))
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|error| {
+                McpError::Start(format!("invalid value for HTTP header '{name}': {error}"))
+            })?;
+            headers.insert(name, value);
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| McpError::Http(error.to_string()))?;
+        let mut session = Self {
+            server_name: display_server_name(config),
+            client,
+            url: url.to_owned(),
+            headers,
+            session_id: None,
+            next_id: 1,
+        };
+        session.initialize().await?;
+        Ok(session)
+    }
+
+    async fn initialize(&mut self) -> Result<(), McpError> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "chatbot-ai-desktop",
+                    "version": "0.3.0"
+                }
+            }),
+        )
+        .await?;
+        self.notification("notifications/initialized", json!({}))
+            .await
+    }
+
+    async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpError> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let params = cursor
+                .as_ref()
+                .map(|value| json!({ "cursor": value }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.request("tools/list", params).await?;
+            let parsed = serde_json::from_value::<ToolsListResult>(result)?;
+            tools.extend(parsed.tools);
+
+            match parsed.next_cursor.filter(|value| !value.trim().is_empty()) {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(tools)
+    }
+
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallResult, McpError> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments
+                }),
+            )
+            .await?;
+
+        serde_json::from_value::<ToolCallResult>(result).map_err(Into::into)
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        let response = self.send_message(message).await?;
+        parse_http_response(&response, id)
+    }
+
+    async fn notification(&mut self, method: &str, params: Value) -> Result<(), McpError> {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+        self.send_message(message).await.map(|_| ())
+    }
+
+    async fn send_message(&mut self, message: Value) -> Result<String, McpError> {
+        let mut request = self
+            .client
+            .post(&self.url)
+            .headers(self.headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+            .json(&message);
+        if let Some(session_id) = &self.session_id {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+
+        let response = request.send().await.map_err(|error| {
+            McpError::Http(format!(
+                "remote MCP server '{}' request failed: {error}",
+                self.server_name
+            ))
+        })?;
+        let status = response.status();
+        if self.session_id.is_none() {
+            self.session_id = response
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+        }
+        let authentication = response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .text()
+            .await
+            .map_err(|error| McpError::Http(error.to_string()))?;
+
+        if !status.is_success() {
+            let auth_hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+                format!(
+                    " Authorization is required. Add a Bearer/API-key header or complete the server OAuth flow.{}",
+                    authentication
+                        .map(|value| format!(" WWW-Authenticate: {value}."))
+                        .unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
+            return Err(McpError::Http(format!(
+                "remote MCP server '{}' returned HTTP {}.{} {}",
+                self.server_name,
+                status.as_u16(),
+                auth_hint,
+                preview_text(&body, 800)
+            )));
+        }
+
+        Ok(body)
+    }
+
+    async fn close(self) {
+        if self.session_id.is_none() {
+            return;
+        }
+        let mut request = self
+            .client
+            .delete(&self.url)
+            .headers(self.headers)
+            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION);
+        if let Some(session_id) = self.session_id {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+        let _ = request.send().await;
+    }
+}
+
+enum McpSession {
+    Stdio(Box<McpStdioSession>),
+    Http(McpHttpSession),
+}
+
+impl McpSession {
+    async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        match config.transport {
+            McpTransport::Stdio => McpStdioSession::connect(config)
+                .await
+                .map(Box::new)
+                .map(Self::Stdio),
+            McpTransport::StreamableHttp => McpHttpSession::connect(config).await.map(Self::Http),
+        }
+    }
+
+    async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpError> {
+        match self {
+            Self::Stdio(session) => session.list_tools().await,
+            Self::Http(session) => session.list_tools().await,
+        }
+    }
+
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallResult, McpError> {
+        match self {
+            Self::Stdio(session) => session.call_tool(name, arguments).await,
+            Self::Http(session) => session.call_tool(name, arguments).await,
+        }
+    }
+
+    async fn close(self) {
+        match self {
+            Self::Stdio(session) => (*session).close().await,
+            Self::Http(session) => session.close().await,
+        }
+    }
+}
+
+fn parse_http_response(body: &str, id: u64) -> Result<Value, McpError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::Protocol(format!(
+            "remote MCP response to request {id} was empty"
+        )));
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return rpc_result_from_payload(value, id);
+    }
+
+    for event in trimmed.replace("\r\n", "\n").split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            if let Ok(result) = rpc_result_from_payload(value, id) {
+                return Ok(result);
+            }
+        }
+    }
+
+    Err(McpError::Protocol(format!(
+        "remote MCP response did not contain JSON-RPC result for request {id}: {}",
+        preview_text(trimmed, 800)
+    )))
+}
+
+fn rpc_result_from_payload(value: Value, id: u64) -> Result<Value, McpError> {
+    let values = match value {
+        Value::Array(values) => values,
+        value => vec![value],
+    };
+    let id_value = json!(id);
+
+    for value in values {
+        let response = serde_json::from_value::<RpcResponse>(value)?;
+        if response.id.as_ref() != Some(&id_value) {
+            continue;
+        }
+        if let Some(error) = response.error {
+            let data = error
+                .data
+                .map(|value| format!(" data={}", compact_json(&value)))
+                .unwrap_or_default();
+            return Err(McpError::Protocol(format!(
+                "MCP error {}: {}{}",
+                error.code, error.message, data
+            )));
+        }
+        return response
+            .result
+            .ok_or_else(|| McpError::Protocol("MCP response has no result".to_owned()));
+    }
+
+    Err(McpError::Protocol(format!(
+        "MCP response has no matching id {id}"
+    )))
+}
+
+pub async fn test_mcp_server(config: McpServerConfig) -> McpConnectionTestResult {
+    let server_id = config.id.clone();
+    let server_name = display_server_name(&config);
+    let mut session = match McpSession::connect(&config).await {
+        Ok(session) => session,
+        Err(error) => {
+            return McpConnectionTestResult {
+                server_id,
+                server_name,
+                connected: false,
+                status: error.to_string(),
+                tools: Vec::new(),
+            };
+        }
+    };
+
+    let result = match session.list_tools().await {
+        Ok(mut tools) => {
+            attach_server(&mut tools, &config);
+            McpConnectionTestResult {
+                server_id,
+                server_name,
+                connected: true,
+                status: format!("connected, tools/list returned {} tool(s)", tools.len()),
+                tools,
+            }
+        }
+        Err(error) => McpConnectionTestResult {
+            server_id,
+            server_name,
+            connected: false,
+            status: format!("connected, but tools/list failed: {error}"),
+            tools: Vec::new(),
+        },
+    };
+
+    session.close().await;
+    result
+}
+
+pub async fn prepare_mcp_context(user_message: &str, settings: &McpSettings) -> McpRuntimeContext {
+    let configs = settings.enabled_servers();
+    if configs.is_empty() {
         return McpRuntimeContext::disabled();
     }
 
+    let total = configs.len();
     let mut context = McpRuntimeContext {
         enabled: true,
         status: "connecting".to_owned(),
         tools: Vec::new(),
         tool_call: None,
     };
+    let mut statuses = Vec::new();
+    let mut sessions: Vec<(McpServerConfig, McpSession)> = Vec::new();
 
-    let mut session = match McpStdioSession::connect().await {
-        Ok(session) => session,
-        Err(error) => {
-            context.status = format!("unavailable: {error}");
-            return context;
-        }
-    };
+    for config in configs {
+        let server_name = display_server_name(&config);
+        let mut session = match McpSession::connect(&config).await {
+            Ok(session) => session,
+            Err(error) => {
+                statuses.push(format!("{server_name}: unavailable ({error})"));
+                continue;
+            }
+        };
 
-    match session.list_tools().await {
-        Ok(tools) => {
-            context.status = "connected".to_owned();
-            context.tools = tools;
-        }
-        Err(error) => {
-            context.status = format!("connected, but tools/list failed: {error}");
-            session.close().await;
-            return context;
+        match session.list_tools().await {
+            Ok(mut tools) => {
+                attach_server(&mut tools, &config);
+                statuses.push(format!("{server_name}: {} tool(s)", tools.len()));
+                context.tools.extend(tools);
+                sessions.push((config, session));
+            }
+            Err(error) => {
+                statuses.push(format!("{server_name}: tools/list failed ({error})"));
+                session.close().await;
+            }
         }
     }
+
+    context.status = format!(
+        "{}/{} connected: {}",
+        sessions.len(),
+        total,
+        statuses.join("; ")
+    );
 
     if let Some(call_request) = build_tool_call_request(user_message, &context.tools) {
         let arguments_text = compact_json(&call_request.arguments);
-        match session
-            .call_tool(&call_request.tool_name, call_request.arguments)
-            .await
+        if let Some((config, session)) = sessions
+            .iter_mut()
+            .find(|(config, _)| config.id == call_request.server_id)
         {
-            Ok(result) => {
-                context.tool_call = Some(McpToolCallInfo {
-                    tool_name: call_request.tool_name,
-                    arguments: arguments_text,
-                    result: format_tool_result(&result),
-                    is_error: result.is_error,
-                });
-            }
-            Err(error) => {
-                context.tool_call = Some(McpToolCallInfo {
-                    tool_name: call_request.tool_name,
-                    arguments: arguments_text,
-                    result: error.to_string(),
-                    is_error: true,
-                });
-            }
+            let server_id = config.id.clone();
+            let server_name = display_server_name(config);
+            context.tool_call = Some(
+                match session
+                    .call_tool(&call_request.tool_name, call_request.arguments)
+                    .await
+                {
+                    Ok(result) => McpToolCallInfo {
+                        server_id,
+                        server_name,
+                        tool_name: call_request.tool_name,
+                        arguments: arguments_text,
+                        result: format_tool_result(&result),
+                        is_error: result.is_error,
+                    },
+                    Err(error) => McpToolCallInfo {
+                        server_id,
+                        server_name,
+                        tool_name: call_request.tool_name,
+                        arguments: arguments_text,
+                        result: error.to_string(),
+                        is_error: true,
+                    },
+                },
+            );
         }
     }
 
-    session.close().await;
+    for (_, session) in sessions {
+        session.close().await;
+    }
     context
+}
+
+pub async fn execute_mcp_tool(
+    settings: &McpSettings,
+    server_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> McpToolCallInfo {
+    let arguments_text = compact_json(&arguments);
+    let Some(config) = settings
+        .enabled_servers()
+        .into_iter()
+        .find(|config| config.id == server_id)
+    else {
+        return McpToolCallInfo {
+            server_id: server_id.to_owned(),
+            server_name: server_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments: arguments_text,
+            result: "The selected MCP server is not enabled.".to_owned(),
+            is_error: true,
+        };
+    };
+
+    let server_name = display_server_name(&config);
+    let mut session = match McpSession::connect(&config).await {
+        Ok(session) => session,
+        Err(error) => {
+            return McpToolCallInfo {
+                server_id: config.id,
+                server_name,
+                tool_name: tool_name.to_owned(),
+                arguments: arguments_text,
+                result: error.to_string(),
+                is_error: true,
+            };
+        }
+    };
+
+    let result = match session.call_tool(tool_name, arguments).await {
+        Ok(result) => McpToolCallInfo {
+            server_id: config.id,
+            server_name,
+            tool_name: tool_name.to_owned(),
+            arguments: arguments_text,
+            result: format_tool_result(&result),
+            is_error: result.is_error,
+        },
+        Err(error) => McpToolCallInfo {
+            server_id: config.id,
+            server_name,
+            tool_name: tool_name.to_owned(),
+            arguments: arguments_text,
+            result: error.to_string(),
+            is_error: true,
+        },
+    };
+    session.close().await;
+    result
 }
 
 pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
@@ -432,27 +957,30 @@ pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
         return String::new();
     }
 
-    let mut sections = Vec::new();
-    sections.push(format!(
-        "Everything MCP context:\nconnection_status: {}",
-        preview_text(&context.status, 500)
-    ));
+    let mut sections = vec![format!(
+        "MCP context:\nconnection_status: {}",
+        preview_text(&context.status, 1200)
+    )];
 
     if context.tools.is_empty() {
         sections.push(
-            "Available Everything MCP tools: none returned. If the user asked for MCP tools, explain that the MCP connection did not provide a list."
+            "Available MCP tools: none returned. If the user asked for MCP tools, explain that the enabled MCP connections did not provide a list."
                 .to_owned(),
         );
     } else {
         let tools = context
             .tools
             .iter()
-            .take(40)
+            .take(100)
             .map(|tool| {
                 format!(
-                    "- {}: {} inputSchema={}",
+                    "- [{}] {}: {} inputSchema={}",
+                    tool.server_name,
                     tool.name,
-                    preview_text(tool.description.as_deref().unwrap_or("No description."), 500),
+                    preview_text(
+                        tool.description.as_deref().unwrap_or("No description."),
+                        500
+                    ),
                     compact_json(&tool.input_schema)
                 )
             })
@@ -460,8 +988,11 @@ pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
             .join("\n");
 
         sections.push(format!(
-            "Available Everything MCP tools:\n{tools}\n\n\
-             Use this list when the user asks what Everything MCP can do. \
+            "Available MCP tools:\n{tools}\n\n\
+             Use this list when the user asks what MCP can do. MCP tools are available to an \
+             automatic tool router; /mcp is only a manual fallback. For a write tool with a \
+             confirmed parameter, ask for explicit confirmation after presenting the details. \
+             After the user confirms, the router will execute it on the next turn. \
              Do not claim a tool was invoked unless an mcp_tool_call_result block is present."
         ));
     }
@@ -469,10 +1000,13 @@ pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
     if let Some(call) = &context.tool_call {
         sections.push(format!(
             "mcp_tool_call_result:\n\
+             server: {} ({})\n\
              tool: {}\n\
              arguments: {}\n\
              is_error: {}\n\
              result:\n{}",
+            call.server_name,
+            call.server_id,
             call.tool_name,
             call.arguments,
             call.is_error,
@@ -480,7 +1014,7 @@ pub fn build_mcp_instruction(context: &McpRuntimeContext) -> String {
         ));
     } else {
         sections.push(
-            "mcp_tool_call_result: none. If the user wants a direct MCP call, ask them to use /mcp <toolName> {jsonArgs} or name a listed tool and arguments."
+            "mcp_tool_call_result: none. A direct call can use /mcp <serverId> <toolName> {jsonArgs}; if a tool name is unique, /mcp <toolName> {jsonArgs} also works."
                 .to_owned(),
         );
     }
@@ -495,24 +1029,16 @@ fn build_tool_call_request(user_message: &str, tools: &[McpTool]) -> Option<McpT
 
     let message = user_message.trim();
     let lower = message.to_lowercase();
-    let wants_mcp = lower.starts_with("/mcp")
-        || lower.contains("mcp")
-        || lower.contains("everything")
-        || lower.contains("model context protocol");
-
-    if !wants_mcp {
-        return None;
-    }
-
     let has_call_intent = lower.starts_with("/mcp")
         || [
             "call",
             "invoke",
             "execute",
             "run",
-            "\u{0432}\u{044b}\u{0437}\u{043e}\u{0432}",
-            "\u{0437}\u{0430}\u{043f}\u{0443}\u{0441}\u{0442}",
-            "\u{0432}\u{044b}\u{043f}\u{043e}\u{043b}\u{043d}",
+            "вызов",
+            "вызови",
+            "запуст",
+            "выполн",
         ]
         .iter()
         .any(|word| lower.contains(word));
@@ -526,6 +1052,7 @@ fn build_tool_call_request(user_message: &str, tools: &[McpTool]) -> Option<McpT
         .unwrap_or_else(|| infer_arguments_from_message(message, &lower, tool));
 
     Some(McpToolCallRequest {
+        server_id: tool.server_id.clone(),
         tool_name: tool.name.clone(),
         arguments,
     })
@@ -537,12 +1064,25 @@ fn find_requested_tool<'a>(
     tools: &'a [McpTool],
 ) -> Option<&'a McpTool> {
     if lower.starts_with("/mcp") {
-        if let Some(name) = message
+        let parts = message
+            .split_once('{')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(message)
             .split_whitespace()
-            .nth(1)
-            .map(|value| value.trim_matches(|character: char| !is_tool_name_character(character)))
-            .filter(|value| !value.is_empty())
-        {
+            .skip(1)
+            .map(clean_command_token)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+
+        if parts.len() >= 2 {
+            if let Some(tool) = tools.iter().find(|tool| {
+                server_matches(tool, parts[0]) && tool.name.eq_ignore_ascii_case(parts[1])
+            }) {
+                return Some(tool);
+            }
+        }
+
+        if let Some(name) = parts.first() {
             if let Some(tool) = tools
                 .iter()
                 .find(|tool| tool.name.eq_ignore_ascii_case(name))
@@ -555,6 +1095,14 @@ fn find_requested_tool<'a>(
     tools
         .iter()
         .find(|tool| contains_word(lower, &tool.name.to_lowercase()))
+}
+
+fn server_matches(tool: &McpTool, value: &str) -> bool {
+    tool.server_id.eq_ignore_ascii_case(value) || tool.server_name.eq_ignore_ascii_case(value)
+}
+
+fn clean_command_token(value: &str) -> &str {
+    value.trim_matches(|character: char| !is_tool_name_character(character))
 }
 
 fn parse_json_arguments(message: &str) -> Option<Value> {
@@ -585,10 +1133,9 @@ fn infer_arguments_from_message(message: &str, lower: &str, tool: &McpTool) -> V
     let mut arguments = Map::new();
     let numbers = extract_numbers(message);
 
-    if property_names
-        .iter()
-        .all(|name| property_type(properties, name).is_some_and(|kind| kind == "number" || kind == "integer"))
-        && numbers.len() >= property_names.len()
+    if property_names.iter().all(|name| {
+        property_type(properties, name).is_some_and(|kind| kind == "number" || kind == "integer")
+    }) && numbers.len() >= property_names.len()
     {
         for (name, value) in property_names.iter().zip(numbers.iter()) {
             arguments.insert(name.clone(), number_to_json(*value));
@@ -727,6 +1274,23 @@ fn format_tool_result(result: &ToolCallResult) -> String {
     }
 }
 
+fn attach_server(tools: &mut [McpTool], config: &McpServerConfig) {
+    let server_name = display_server_name(config);
+    for tool in tools {
+        tool.server_id = config.id.clone();
+        tool.server_name = server_name.clone();
+    }
+}
+
+fn display_server_name(config: &McpServerConfig) -> String {
+    let name = config.name.trim();
+    if name.is_empty() {
+        config.id.clone()
+    } else {
+        name.to_owned()
+    }
+}
+
 fn contains_word(haystack: &str, needle: &str) -> bool {
     haystack
         .split(|character: char| !is_tool_name_character(character))
@@ -734,7 +1298,7 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 }
 
 fn is_tool_name_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+    character.is_alphanumeric() || character == '_' || character == '-'
 }
 
 fn compact_json(value: &Value) -> String {
@@ -752,47 +1316,210 @@ fn preview_text(value: &str, max_chars: usize) -> String {
     preview
 }
 
-fn everything_command() -> Command {
-    if let Some(local_bin) = find_local_everything_bin() {
-        if cfg!(windows) {
-            let mut command = Command::new("cmd.exe");
-            command.arg("/C").arg(local_bin);
-            return command;
-        }
-
-        return Command::new(local_bin);
+fn configured_command(config: &McpServerConfig) -> Result<Command, McpError> {
+    let executable = config.command.trim();
+    if executable.is_empty() {
+        return Err(McpError::Start(format!(
+            "MCP server '{}' has an empty command",
+            display_server_name(config)
+        )));
     }
 
-    if cfg!(windows) {
+    if cfg!(windows) && is_windows_command_shim(executable) {
         let mut command = Command::new("cmd.exe");
-        command.args(["/C", "npx", "-y", EVERYTHING_PACKAGE]);
-        command
-    } else {
-        let mut command = Command::new("npx");
-        command.args(["-y", EVERYTHING_PACKAGE]);
-        command
+        command.args(["/D", "/C", executable]);
+        command.args(&config.args);
+        return Ok(command);
+    }
+
+    let mut command = Command::new(executable);
+    command.args(&config.args);
+    Ok(command)
+}
+
+fn is_windows_command_shim(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.ends_with(".cmd")
+        || lower.ends_with(".bat")
+        || matches!(lower.as_str(), "npm" | "npx" | "pnpm" | "yarn")
+}
+
+fn default_everything_server() -> McpServerConfig {
+    McpServerConfig {
+        id: "everything".to_owned(),
+        name: "Everything".to_owned(),
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: "npx".to_owned(),
+        args: vec!["-y".to_owned(), EVERYTHING_PACKAGE.to_owned()],
+        env: BTreeMap::new(),
+        cwd: None,
+        url: None,
+        headers: BTreeMap::new(),
     }
 }
 
-fn find_local_everything_bin() -> Option<PathBuf> {
-    let bin_name = if cfg!(windows) {
-        "mcp-server-everything.CMD"
-    } else {
-        "mcp-server-everything"
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut roots = Vec::new();
-    if let Ok(current_dir) = env::current_dir() {
-        roots.extend(current_dir.ancestors().map(Path::to_path_buf));
+    fn tool(server_id: &str, server_name: &str, name: &str) -> McpTool {
+        McpTool {
+            server_id: server_id.to_owned(),
+            server_name: server_name.to_owned(),
+            name: name.to_owned(),
+            title: None,
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }
     }
 
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        let manifest_path = Path::new(manifest_dir);
-        roots.extend(manifest_path.ancestors().map(Path::to_path_buf));
+    #[test]
+    fn slash_command_can_select_server_and_tool() {
+        let tools = vec![tool("one", "First", "echo"), tool("two", "Second", "echo")];
+        let request = build_tool_call_request("/mcp two echo {\"message\":\"hi\"}", &tools)
+            .expect("tool call should be parsed");
+
+        assert_eq!(request.server_id, "two");
+        assert_eq!(request.tool_name, "echo");
+        assert_eq!(request.arguments, json!({"message": "hi"}));
     }
 
-    roots
-        .into_iter()
-        .map(|root| root.join("node_modules").join(".bin").join(bin_name))
-        .find(|candidate| candidate.is_file())
+    #[test]
+    fn unique_tool_keeps_short_slash_syntax() {
+        let tools = vec![tool("one", "First", "add")];
+        let request = build_tool_call_request("/mcp add {\"a\":2,\"b\":3}", &tools)
+            .expect("tool call should be parsed");
+
+        assert_eq!(request.server_id, "one");
+        assert_eq!(request.tool_name, "add");
+    }
+
+    #[test]
+    fn parses_streamable_http_sse_response() {
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let result = parse_http_response(body, 1).expect("SSE result should be parsed");
+
+        assert_eq!(result, json!({"tools": []}));
+    }
+
+    #[test]
+    #[ignore = "requires npm install and the local Everything MCP package"]
+    fn everything_server_connects_and_lists_tools() {
+        let result = tauri::async_runtime::block_on(test_mcp_server(default_everything_server()));
+
+        assert!(result.connected, "{}", result.status);
+        assert!(!result.tools.is_empty(), "{}", result.status);
+        println!("{}", result.status);
+        for tool in result.tools {
+            println!("- [{}] {}", tool.server_name, tool.name);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires network access to the public Cloudflare Docs MCP"]
+    fn remote_http_server_connects_and_lists_tools() {
+        let config = McpServerConfig {
+            id: "cloudflare-docs".to_owned(),
+            name: "Cloudflare Docs".to_owned(),
+            enabled: true,
+            transport: McpTransport::StreamableHttp,
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            url: Some("https://docs.mcp.cloudflare.com/mcp".to_owned()),
+            headers: BTreeMap::new(),
+        };
+        let result = tauri::async_runtime::block_on(test_mcp_server(config));
+
+        assert!(result.connected, "{}", result.status);
+        assert!(!result.tools.is_empty(), "{}", result.status);
+        println!("{}", result.status);
+        for tool in result.tools {
+            println!("- [{}] {}", tool.server_name, tool.name);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires YandexTrackerMCP running in mock mode on localhost:8788"]
+    fn agent_calls_yandex_tracker_mcp_tool() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Authorization".to_owned(),
+            "Bearer local-test-secret".to_owned(),
+        );
+        let settings = McpSettings {
+            servers: vec![McpServerConfig {
+                id: "yandex-tracker".to_owned(),
+                name: "Yandex Tracker".to_owned(),
+                enabled: true,
+                transport: McpTransport::StreamableHttp,
+                command: String::new(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                cwd: None,
+                url: Some(
+                    std::env::var("YANDEX_TRACKER_MCP_TEST_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:8788/mcp".to_owned()),
+                ),
+                headers,
+            }],
+            everything_enabled: false,
+        };
+        let message = "/mcp yandex-tracker create_issue {\
+            \"summary\":\"Day 17 MCP demo\",\
+            \"queue\":\"TEST\",\
+            \"confirmed\":true,\
+            \"unique\":\"day17-e2e-tracker-demo\"\
+        }";
+
+        let context = tauri::async_runtime::block_on(prepare_mcp_context(message, &settings));
+        let tool = context
+            .tools
+            .iter()
+            .find(|tool| tool.name == "create_issue")
+            .expect("tools/list should return create_issue");
+        let required = tool
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("tool schema should declare required parameters");
+        assert!(required.iter().any(|value| value == "summary"));
+        assert!(required.iter().any(|value| value == "confirmed"));
+        assert!(tool
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Create"));
+        let call = context
+            .tool_call
+            .expect("agent should call create_calendar_event");
+
+        assert_eq!(call.server_id, "yandex-tracker");
+        assert_eq!(call.tool_name, "create_issue");
+        assert!(!call.is_error, "{}", call.result);
+        assert!(call.result.contains("Day 17 MCP demo"), "{}", call.result);
+        assert!(call.result.contains("mock"), "{}", call.result);
+        println!("MCP tool result:\n{}", call.result);
+
+        let agentic_call = tauri::async_runtime::block_on(execute_mcp_tool(
+            &settings,
+            "yandex-tracker",
+            "create_issue",
+            json!({
+                "summary": "Agent-selected MCP tool",
+                "queue": "TEST",
+                "confirmed": true,
+                "unique": "day17-agent-selected-tool"
+            }),
+        ));
+        assert!(!agentic_call.is_error, "{}", agentic_call.result);
+        assert!(
+            agentic_call.result.contains("Agent-selected MCP tool"),
+            "{}",
+            agentic_call.result
+        );
+    }
 }

@@ -10,6 +10,8 @@ import type {
   MemoryDecision,
   MemoryItem,
   MemoryLayerId,
+  McpConnectionTestResult,
+  McpServerConfig,
   AgentStreamDelta,
   OrchestratorAction,
   ShortTermCompressionSettings,
@@ -175,7 +177,7 @@ interface AppSettings {
   shortTermCompressionEnabled: boolean;
   shortTermCompressionTurnLimit: number;
   orchestrationEnabled: boolean;
-  mcpEverythingEnabled: boolean;
+  mcpServers: McpServerConfig[];
   validatorInvariants: string;
   debugManualStateControls: boolean;
 }
@@ -223,7 +225,18 @@ const DEFAULT_SETTINGS: AppSettings = {
   shortTermCompressionEnabled: true,
   shortTermCompressionTurnLimit: 10,
   orchestrationEnabled: false,
-  mcpEverythingEnabled: true,
+  mcpServers: [
+    {
+      id: "everything",
+      name: "Everything",
+      enabled: true,
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-everything"],
+      env: {},
+      headers: {}
+    }
+  ],
   validatorInvariants: DEFAULT_VALIDATOR_INVARIANTS,
   debugManualStateControls: false
 };
@@ -295,10 +308,22 @@ function loadSettings(): AppSettings {
       return DEFAULT_SETTINGS;
     }
 
-    const parsed = JSON.parse(saved) as Partial<AppSettings>;
+    const parsed = JSON.parse(saved) as Partial<AppSettings> & {
+      mcpEverythingEnabled?: boolean;
+    };
+    const mcpServers = Array.isArray(parsed.mcpServers)
+      ? normalizeMcpServers(parsed.mcpServers)
+      : DEFAULT_SETTINGS.mcpServers.map((server) => ({
+          ...server,
+          enabled: parsed.mcpEverythingEnabled ?? server.enabled,
+          args: [...server.args],
+          env: { ...server.env },
+          headers: { ...server.headers }
+        }));
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      mcpServers,
       shortTermCompressionTurnLimit: normalizeCompressionTurnLimit(
         parsed.shortTermCompressionTurnLimit
       )
@@ -306,6 +331,66 @@ function loadSettings(): AppSettings {
   } catch {
     return DEFAULT_SETTINGS;
   }
+}
+
+function normalizeMcpServers(servers: McpServerConfig[]): McpServerConfig[] {
+  return servers
+    .filter((server) => server && typeof server === "object")
+    .map((server, index) => ({
+      id:
+        typeof server.id === "string" && server.id.trim()
+          ? server.id.trim()
+          : `mcp-${index + 1}`,
+      name:
+        typeof server.name === "string" && server.name.trim()
+          ? server.name.trim()
+          : `MCP ${index + 1}`,
+      enabled: server.enabled !== false,
+      transport:
+        server.transport === "streamableHttp" ? "streamableHttp" : "stdio",
+      command: typeof server.command === "string" ? server.command : "",
+      args: Array.isArray(server.args)
+        ? server.args.filter((arg): arg is string => typeof arg === "string")
+        : [],
+      env:
+        server.env && typeof server.env === "object" && !Array.isArray(server.env)
+          ? Object.fromEntries(
+              Object.entries(server.env)
+                .filter(
+                  (entry): entry is [string, string] =>
+                    Boolean(entry[0].trim()) && typeof entry[1] === "string"
+                )
+            )
+          : {},
+      cwd: typeof server.cwd === "string" ? server.cwd : undefined,
+      url: typeof server.url === "string" ? server.url : undefined,
+      headers:
+        server.headers && typeof server.headers === "object" && !Array.isArray(server.headers)
+          ? Object.fromEntries(
+              Object.entries(server.headers).filter(
+                (entry): entry is [string, string] =>
+                  Boolean(entry[0].trim()) && typeof entry[1] === "string"
+              )
+            )
+          : {}
+    }));
+}
+
+function createMcpServer(
+  index: number,
+  transport: McpServerConfig["transport"]
+): McpServerConfig {
+  return {
+    id: crypto.randomUUID(),
+    name: transport === "streamableHttp" ? `Remote MCP ${index}` : `MCP ${index}`,
+    enabled: true,
+    transport,
+    command: transport === "stdio" ? "npx" : "",
+    args: [],
+    env: {},
+    url: transport === "streamableHttp" ? "https://" : undefined,
+    headers: {}
+  };
 }
 
 function normalizeCompressionTurnLimit(value: unknown): number {
@@ -937,6 +1022,10 @@ function App() {
   const [swarmActorLogs, setSwarmActorLogs] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [lastReply, setLastReply] = useState<AgentReply | null>(null);
+  const [testingMcpServerId, setTestingMcpServerId] = useState<string | null>(null);
+  const [mcpConnectionTests, setMcpConnectionTests] = useState<
+    Record<string, McpConnectionTestResult>
+  >({});
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
@@ -1047,6 +1136,7 @@ function App() {
     swarmActors.length > 0 &&
     (isLoading || taskState.phase === "execution" || taskState.phase === "validation");
   const hasSwarmLogs = hasAnySwarmLog(swarmActorLogs);
+  const enabledMcpServers = settings.mcpServers.filter((server) => server.enabled);
 
   useEffect(() => {
     localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify(chats));
@@ -1142,6 +1232,164 @@ function App() {
           ? current.shortTermCompressionTurnLimit
           : normalizeCompressionTurnLimit(nextSettings.shortTermCompressionTurnLimit)
     }));
+  }
+
+  function updateMcpServer(serverId: string, patch: Partial<McpServerConfig>) {
+    setSettings((current) => ({
+      ...current,
+      mcpServers: current.mcpServers.map((server) =>
+        server.id === serverId ? { ...server, ...patch } : server
+      )
+    }));
+    setMcpConnectionTests((current) => {
+      const next = { ...current };
+      delete next[serverId];
+      return next;
+    });
+  }
+
+  function addMcpServer(transport: McpServerConfig["transport"]) {
+    setSettings((current) => ({
+      ...current,
+      mcpServers: [
+        ...current.mcpServers,
+        createMcpServer(current.mcpServers.length + 1, transport)
+      ]
+    }));
+  }
+
+  function addFigmaMcpServer() {
+    setSettings((current) => ({
+      ...current,
+      mcpServers: [
+        ...current.mcpServers,
+        {
+          ...createMcpServer(current.mcpServers.length + 1, "streamableHttp"),
+          name: "Figma Remote",
+          url: "https://mcp.figma.com/mcp"
+        }
+      ]
+    }));
+  }
+
+  function addYandexTrackerMcpServer() {
+    setSettings((current) => {
+      let suffix = 1;
+      let id = "yandex-tracker";
+      while (current.mcpServers.some((server) => server.id === id)) {
+        suffix += 1;
+        id = `yandex-tracker-${suffix}`;
+      }
+
+      return {
+        ...current,
+        mcpServers: [
+          ...current.mcpServers,
+          {
+            ...createMcpServer(current.mcpServers.length + 1, "streamableHttp"),
+            id,
+            name: "Yandex Tracker",
+            enabled: false,
+            url: "http://127.0.0.1:8788/mcp",
+            headers: { Authorization: "Bearer change-me" }
+          }
+        ]
+      };
+    });
+  }
+
+  function removeMcpServer(serverId: string) {
+    setSettings((current) => ({
+      ...current,
+      mcpServers: current.mcpServers.filter((server) => server.id !== serverId)
+    }));
+    setMcpConnectionTests((current) => {
+      const next = { ...current };
+      delete next[serverId];
+      return next;
+    });
+  }
+
+  function updateMcpEnvironmentVariable(
+    server: McpServerConfig,
+    previousKey: string,
+    key: string,
+    value: string
+  ) {
+    const env = { ...server.env };
+    if (previousKey !== key) {
+      delete env[previousKey];
+    }
+    if (key.trim()) {
+      env[key] = value;
+    }
+    updateMcpServer(server.id, { env });
+  }
+
+  function addMcpEnvironmentVariable(server: McpServerConfig) {
+    let index = Object.keys(server.env).length + 1;
+    let key = `VARIABLE_${index}`;
+    while (key in server.env) {
+      index += 1;
+      key = `VARIABLE_${index}`;
+    }
+    updateMcpServer(server.id, { env: { ...server.env, [key]: "" } });
+  }
+
+  function updateMcpHeader(
+    server: McpServerConfig,
+    previousKey: string,
+    key: string,
+    value: string
+  ) {
+    const headers = { ...server.headers };
+    if (previousKey !== key) {
+      delete headers[previousKey];
+    }
+    if (key.trim()) {
+      headers[key] = value;
+    }
+    updateMcpServer(server.id, { headers });
+  }
+
+  function addMcpHeader(server: McpServerConfig) {
+    let index = Object.keys(server.headers).length + 1;
+    let key = index === 1 ? "Authorization" : `X-Header-${index}`;
+    while (key in server.headers) {
+      index += 1;
+      key = `X-Header-${index}`;
+    }
+    updateMcpServer(server.id, { headers: { ...server.headers, [key]: "" } });
+  }
+
+  async function testMcpConnection(server: McpServerConfig) {
+    setTestingMcpServerId(server.id);
+    setMcpConnectionTests((current) => {
+      const next = { ...current };
+      delete next[server.id];
+      return next;
+    });
+
+    try {
+      const result = await invoke<McpConnectionTestResult>("test_mcp_connection", {
+        server
+      });
+      setMcpConnectionTests((current) => ({ ...current, [server.id]: result }));
+    } catch (caughtError) {
+      setMcpConnectionTests((current) => ({
+        ...current,
+        [server.id]: {
+          serverId: server.id,
+          serverName: server.name,
+          connected: false,
+          status:
+            caughtError instanceof Error ? caughtError.message : String(caughtError),
+          tools: []
+        }
+      }));
+    } finally {
+      setTestingMcpServerId(null);
+    }
   }
 
   function selectUserProfile(profileId: string) {
@@ -1579,7 +1827,7 @@ function App() {
             validatorInvariants: settings.validatorInvariants
           },
           mcp: {
-            everythingEnabled: settings.mcpEverythingEnabled
+            servers: settings.mcpServers
           }
         }
       });
@@ -1933,8 +2181,8 @@ function App() {
           <span>long-term: {memoryContext.longTerm.length}</span>
           <span>
             MCP:{" "}
-            {settings.mcpEverythingEnabled
-              ? lastReply?.debug?.mcpStatus ?? "Everything on"
+            {enabledMcpServers.length > 0
+              ? lastReply?.debug?.mcpStatus ?? `${enabledMcpServers.length} on`
               : "off"}
           </span>
         </div>
@@ -2160,10 +2408,10 @@ function App() {
               OpenAI memory-router классифицирует запрос коротким TOON-like
               ответом: рабочий контекст, долгосрочные предпочтения или пропуск.
             </p>
-            {settings.mcpEverythingEnabled && (
+            {enabledMcpServers.length > 0 && (
               <p className="auto-memory-note">
-                Everything MCP is on. Ask what MCP tools are available, or call one directly:{" "}
-                <code>/mcp echo {"{\"message\":\"hello\"}"}</code>.
+                MCP включен. Агент автоматически выбирает инструменты; прямой вызов остаётся запасным вариантом:{" "}
+                <code>/mcp &lt;serverId&gt; &lt;tool&gt; {"{\"arg\":\"value\"}"}</code>.
               </p>
             )}
           </div>
@@ -2641,28 +2889,32 @@ function App() {
                   </div>
                 </dl>
                 <pre>{lastReply.debug.promptPreview}</pre>
-                <strong>Everything MCP tools</strong>
+                <strong>MCP tools</strong>
                 {lastReply.debug.mcpTools.length === 0 ? (
                   <p className="muted-text">
                     {lastReply.debug.mcpEnabled
-                      ? "No tools returned from Everything MCP."
-                      : "Everything MCP is disabled."}
+                      ? "No tools returned from enabled MCP servers."
+                      : "MCP is disabled."}
                   </p>
                 ) : (
                   <div className="mcp-tool-list">
                     {lastReply.debug.mcpTools.map((tool) => (
-                      <div className="mcp-tool-item" key={tool.name}>
-                        <b>{tool.name}</b>
+                      <div
+                        className="mcp-tool-item"
+                        key={`${tool.serverId}:${tool.name}`}
+                      >
+                        <b>[{tool.serverName}] {tool.name}</b>
                         <p>{tool.description ?? "No description."}</p>
                         <code>{formatJsonPreview(tool.inputSchema)}</code>
                       </div>
                     ))}
                   </div>
                 )}
-                <strong>Everything MCP tool call</strong>
+                <strong>MCP tool call</strong>
                 {lastReply.debug.mcpToolCall ? (
                   <pre>
                     {[
+                      `server: ${lastReply.debug.mcpToolCall.serverName} (${lastReply.debug.mcpToolCall.serverId})`,
                       `tool: ${lastReply.debug.mcpToolCall.toolName}`,
                       `arguments: ${lastReply.debug.mcpToolCall.arguments}`,
                       `isError: ${lastReply.debug.mcpToolCall.isError}`,
@@ -2885,23 +3137,318 @@ function App() {
                 </span>
               </label>
 
-              <label className="checkbox-field">
-                <input
-                  type="checkbox"
-                  checked={settings.mcpEverythingEnabled}
-                  onChange={(event) =>
-                    updateSettings({ mcpEverythingEnabled: event.target.checked })
-                  }
-                />
-                <span>
-                  <b>Everything MCP</b>
-                  <small>
-                    Connects to @modelcontextprotocol/server-everything, adds tools/list
-                    to the agent context, and supports direct calls like
-                    /mcp echo {"{\"message\":\"hello\"}"}.
-                  </small>
-                </span>
-              </label>
+              <section className="mcp-settings-section" aria-labelledby="mcp-settings-title">
+                <div className="mcp-settings-header">
+                  <div>
+                    <b id="mcp-settings-title">MCP-серверы</b>
+                    <small>
+                      Поддерживаются локальные stdio и удалённые Streamable HTTP MCP.
+                      Агент объединяет их tools и сохраняет раздельные идентификаторы.
+                    </small>
+                  </div>
+                  <div className="mcp-add-actions">
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={addYandexTrackerMcpServer}
+                    >
+                      + Tracker
+                    </button>
+                    <button className="ghost-button" type="button" onClick={addFigmaMcpServer}>
+                      + Figma
+                    </button>
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={() => addMcpServer("streamableHttp")}
+                    >
+                      + Remote
+                    </button>
+                    <button
+                      className="ghost-button"
+                      type="button"
+                      onClick={() => addMcpServer("stdio")}
+                    >
+                      + stdio
+                    </button>
+                  </div>
+                </div>
+
+                {settings.mcpServers.length === 0 ? (
+                  <p className="muted-text">
+                    Серверов пока нет. Добавьте MCP и укажите команду запуска.
+                  </p>
+                ) : (
+                  <div className="mcp-server-list">
+                    {settings.mcpServers.map((server) => {
+                      const connectionTest = mcpConnectionTests[server.id];
+                      const isTesting = testingMcpServerId === server.id;
+
+                      return (
+                        <article className="mcp-server-card" key={server.id}>
+                          <div className="mcp-server-card-header">
+                            <label className="mcp-server-toggle">
+                              <input
+                                type="checkbox"
+                                checked={server.enabled}
+                                onChange={(event) =>
+                                  updateMcpServer(server.id, {
+                                    enabled: event.target.checked
+                                  })
+                                }
+                              />
+                              <span>Включен</span>
+                            </label>
+                            <code title="ID для команды /mcp">{server.id}</code>
+                            <button
+                              className="mcp-remove-button"
+                              type="button"
+                              onClick={() => removeMcpServer(server.id)}
+                              aria-label={`Удалить MCP ${server.name}`}
+                            >
+                              <ButtonIcon src={ICONS.cross} />
+                            </button>
+                          </div>
+
+                          <div className="mcp-server-grid">
+                            <label className="field">
+                              <span>Название</span>
+                              <input
+                                value={server.name}
+                                onChange={(event) =>
+                                  updateMcpServer(server.id, { name: event.target.value })
+                                }
+                                placeholder="Filesystem"
+                              />
+                            </label>
+                            <label className="field">
+                              <span>Транспорт</span>
+                              <select
+                                value={server.transport}
+                                onChange={(event) =>
+                                  updateMcpServer(server.id, {
+                                    transport: event.target.value as McpServerConfig["transport"]
+                                  })
+                                }
+                              >
+                                <option value="streamableHttp">Streamable HTTP</option>
+                                <option value="stdio">stdio</option>
+                              </select>
+                            </label>
+                          </div>
+
+                          {server.transport === "stdio" ? (
+                            <>
+                              <label className="field">
+                                <span>Команда</span>
+                                <input
+                                  value={server.command}
+                                  onChange={(event) =>
+                                    updateMcpServer(server.id, { command: event.target.value })
+                                  }
+                                  placeholder="npx, uvx, node или полный путь"
+                                  spellCheck={false}
+                                />
+                              </label>
+
+                              <label className="field">
+                                <span>Аргументы — по одному на строку</span>
+                                <textarea
+                                  value={server.args.join("\n")}
+                                  onChange={(event) =>
+                                    updateMcpServer(server.id, {
+                                      args: event.target.value.split(/\r?\n/)
+                                    })
+                                  }
+                                  rows={Math.max(2, Math.min(5, server.args.length + 1))}
+                                  placeholder={"-y\n@modelcontextprotocol/server-everything"}
+                                  spellCheck={false}
+                                />
+                              </label>
+
+                              <label className="field">
+                                <span>Рабочая папка (необязательно)</span>
+                                <input
+                                  value={server.cwd ?? ""}
+                                  onChange={(event) =>
+                                    updateMcpServer(server.id, { cwd: event.target.value })
+                                  }
+                                  placeholder="C:\\path\\to\\project"
+                                  spellCheck={false}
+                                />
+                              </label>
+
+                              <div className="mcp-env-block">
+                                <div className="mcp-env-header">
+                                  <span>Переменные окружения</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => addMcpEnvironmentVariable(server)}
+                                  >
+                                    + Переменная
+                                  </button>
+                                </div>
+                                {Object.entries(server.env).map(([key, value]) => (
+                                  <div className="mcp-env-row" key={key}>
+                                    <input
+                                      aria-label="Имя переменной окружения"
+                                      value={key}
+                                      onChange={(event) =>
+                                        updateMcpEnvironmentVariable(
+                                          server,
+                                          key,
+                                          event.target.value,
+                                          value
+                                        )
+                                      }
+                                      placeholder="API_KEY"
+                                      spellCheck={false}
+                                    />
+                                    <input
+                                      aria-label={`Значение ${key}`}
+                                      value={value}
+                                      onChange={(event) =>
+                                        updateMcpEnvironmentVariable(
+                                          server,
+                                          key,
+                                          key,
+                                          event.target.value
+                                        )
+                                      }
+                                      placeholder="value"
+                                      type={/key|token|secret|password/i.test(key) ? "password" : "text"}
+                                      spellCheck={false}
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateMcpEnvironmentVariable(server, key, "", "")
+                                      }
+                                      aria-label={`Удалить переменную ${key}`}
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <label className="field">
+                                <span>MCP endpoint URL</span>
+                                <input
+                                  value={server.url ?? ""}
+                                  onChange={(event) =>
+                                    updateMcpServer(server.id, { url: event.target.value })
+                                  }
+                                  placeholder="https://example.com/mcp"
+                                  type="url"
+                                  spellCheck={false}
+                                />
+                              </label>
+
+                              <div className="mcp-env-block">
+                                <div className="mcp-env-header">
+                                  <span>HTTP-заголовки</span>
+                                  <button type="button" onClick={() => addMcpHeader(server)}>
+                                    + Заголовок
+                                  </button>
+                                </div>
+                                {Object.entries(server.headers).map(([key, value]) => (
+                                  <div className="mcp-env-row" key={key}>
+                                    <input
+                                      aria-label="Имя HTTP-заголовка"
+                                      value={key}
+                                      onChange={(event) =>
+                                        updateMcpHeader(server, key, event.target.value, value)
+                                      }
+                                      placeholder="Authorization"
+                                      spellCheck={false}
+                                    />
+                                    <input
+                                      aria-label={`Значение заголовка ${key}`}
+                                      value={value}
+                                      onChange={(event) =>
+                                        updateMcpHeader(server, key, key, event.target.value)
+                                      }
+                                      placeholder="Bearer ..."
+                                      type={/authorization|key|token|secret/i.test(key) ? "password" : "text"}
+                                      spellCheck={false}
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => updateMcpHeader(server, key, "", "")}
+                                      aria-label={`Удалить заголовок ${key}`}
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {server.url === "https://mcp.figma.com/mcp" && (
+                                <p className="mcp-oauth-note">
+                                  Figma Remote требует интерактивный OAuth и сейчас принимает
+                                  только клиенты из каталога Figma. Этот клиент проверит HTTP
+                                  endpoint, но для входа потребуется регистрация приложения у Figma.
+                                </p>
+                              )}
+                              {server.name === "Yandex Tracker" && (
+                                <p className="mcp-oauth-note">
+                                  Укажите URL развёрнутого YandexTrackerMCP и замените
+                                  <code> Bearer change-me</code> на ваш MCP_API_KEY. Затем
+                                  включите сервер и нажмите «Проверить».
+                                </p>
+                              )}
+                            </>
+                          )}
+
+                          <div className="mcp-test-actions">
+                            <button
+                              className="ghost-button"
+                              type="button"
+                              disabled={
+                                isTesting ||
+                                (server.transport === "stdio"
+                                  ? !server.command.trim()
+                                  : !server.url?.trim())
+                              }
+                              onClick={() => void testMcpConnection(server)}
+                            >
+                              {isTesting ? "Подключение…" : "Проверить и получить tools"}
+                            </button>
+                            <small>
+                              Вызов: <code>/mcp {server.id} &lt;tool&gt; {"{...}"}</code>
+                            </small>
+                          </div>
+
+                          {connectionTest && (
+                            <div
+                              className={`mcp-test-result ${
+                                connectionTest.connected ? "success" : "error"
+                              }`}
+                            >
+                              <b>
+                                {connectionTest.connected ? "Соединение установлено" : "Ошибка"}
+                              </b>
+                              <p>{connectionTest.status}</p>
+                              {connectionTest.tools.length > 0 && (
+                                <div className="mcp-test-tools">
+                                  {connectionTest.tools.map((tool) => (
+                                    <code key={`${tool.serverId}:${tool.name}`}>
+                                      {tool.name}
+                                    </code>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
 
               <label className="checkbox-field">
                 <input

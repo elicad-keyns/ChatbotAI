@@ -1,9 +1,10 @@
 use crate::mcp::{
-    build_mcp_instruction, prepare_everything_context, McpSettings, McpTool, McpToolCallInfo,
+    build_mcp_instruction, execute_mcp_tool, prepare_mcp_context, McpRuntimeContext, McpSettings,
+    McpTool, McpToolCallInfo,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     env,
@@ -20,6 +21,12 @@ const MEMORY_REASON_MAX_CHARS: usize = 180;
 const SHORT_TERM_SUMMARY_MODEL: &str = "gpt-4.1-mini";
 const SHORT_TERM_SUMMARY_MAX_OUTPUT_TOKENS: u16 = 700;
 const SHORT_TERM_SUMMARY_MAX_CHARS: usize = 3_500;
+const MCP_TOOL_ROUTER_INSTRUCTIONS: &str = "You are the MCP tool router for an assistant. \
+Select at most one provided function when the conversation requires an external MCP action or read. \
+Use the full conversation to recover parameters that were discussed in earlier turns. \
+For a write function whose schema contains a confirmed parameter, call it only when the latest user \
+message explicitly confirms the immediately preceding assistant confirmation request. \
+Never invent IDs, tokens, tool results, or confirmation. If no tool should run now, return no function call.";
 const SHORT_TERM_SUMMARY_INSTRUCTIONS: &str = "You compress short-term memory for one active chat.
 Update the previous summary with the newly compressed user+assistant turns.
 Preserve only context needed to continue the conversation: user goals, decisions, constraints, unresolved questions, important assistant outputs, project details, and facts referenced later.
@@ -408,6 +415,138 @@ impl Agent {
         }
     }
 
+    async fn prepare_agentic_mcp_context(&self, messages: &[ChatMessage]) -> McpRuntimeContext {
+        let latest_user_message = messages
+            .iter()
+            .rev()
+            .find(|message| normalize_role(&message.role) == "user")
+            .map(|message| message.content.trim())
+            .unwrap_or_default();
+        let mut context = prepare_mcp_context(latest_user_message, &self.mcp).await;
+
+        if context.tool_call.is_some()
+            || context.tools.is_empty()
+            || latest_user_message.to_ascii_lowercase().starts_with("/mcp")
+        {
+            return context;
+        }
+
+        let selected = match self.select_mcp_tool(messages, &context.tools).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                context.status.push_str(&format!(
+                    "; automatic tool routing unavailable ({})",
+                    preview_text(&error, 240)
+                ));
+                return context;
+            }
+        };
+        let Some((tool, mut arguments)) = selected else {
+            return context;
+        };
+
+        if tool_requires_confirmation(&tool) {
+            if !has_explicit_write_confirmation(messages) {
+                context
+                    .status
+                    .push_str("; write tool is waiting for explicit user confirmation");
+                return context;
+            }
+            if let Some(arguments) = arguments.as_object_mut() {
+                arguments.insert("confirmed".to_owned(), Value::Bool(true));
+            }
+        }
+
+        context.tool_call =
+            Some(execute_mcp_tool(&self.mcp, &tool.server_id, &tool.name, arguments).await);
+        context
+    }
+
+    async fn select_mcp_tool(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[McpTool],
+    ) -> Result<Option<(McpTool, Value)>, String> {
+        let bindings = build_mcp_function_bindings(tools);
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        let input = messages
+            .iter()
+            .filter(|message| !message.content.trim().is_empty())
+            .map(|message| {
+                json!({
+                    "role": normalize_role(&message.role),
+                    "content": message.content
+                })
+            })
+            .collect::<Vec<_>>();
+        let function_tools = bindings
+            .iter()
+            .map(|binding| {
+                json!({
+                    "type": "function",
+                    "name": binding.function_name,
+                    "description": format!(
+                        "MCP server '{}', tool '{}'. {}",
+                        binding.tool.server_name,
+                        binding.tool.name,
+                        binding.tool.description.as_deref().unwrap_or("No description.")
+                    ),
+                    "parameters": binding.tool.input_schema,
+                    "strict": false
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = json!({
+            "model": self.model,
+            "instructions": MCP_TOOL_ROUTER_INSTRUCTIONS,
+            "input": input,
+            "tools": function_tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "max_output_tokens": 500
+        });
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| format!("MCP tool-router request failed: {error}"))?;
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| format!("MCP tool-router response read failed: {error}"))?;
+        if !status.is_success() {
+            return Err(format_openai_error(status.as_u16(), &response_text));
+        }
+        let response = serde_json::from_str::<OpenAIResponse>(&response_text)
+            .map_err(|error| format!("MCP tool-router response parse failed: {error}"))?;
+        let Some(call) = response.function_call() else {
+            return Ok(None);
+        };
+        let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.function_name == call.name)
+        else {
+            return Err(format!(
+                "MCP tool-router selected unknown function '{}'.",
+                call.name
+            ));
+        };
+        let arguments = serde_json::from_str::<Value>(&call.arguments)
+            .map_err(|error| format!("MCP tool-router returned invalid arguments: {error}"))?;
+        if !arguments.is_object() {
+            return Err("MCP tool-router arguments must be a JSON object.".to_owned());
+        }
+        Ok(Some((binding.tool.clone(), arguments)))
+    }
+
     pub async fn send_stream<F, G, H>(
         &self,
         messages: Vec<ChatMessage>,
@@ -437,7 +576,7 @@ impl Agent {
             .find(|message| normalize_role(&message.role) == "user")
             .map(|message| message.content.trim().to_owned())
             .unwrap_or_default();
-        let mcp_context = prepare_everything_context(&latest_user_message, &self.mcp).await;
+        let mcp_context = self.prepare_agentic_mcp_context(&messages).await;
         let mcp_instruction = build_mcp_instruction(&mcp_context);
 
         let short_term_preparation = self.prepare_short_term_messages(&messages).await;
@@ -608,11 +747,16 @@ impl Agent {
             .find(|message| normalize_role(&message.role) == "user")
             .map(|message| message.content.trim().to_owned())
             .unwrap_or_default();
+        let mcp_context = self.prepare_agentic_mcp_context(&messages).await;
+        let mcp_instruction = build_mcp_instruction(&mcp_context);
         let short_term_preparation = self.prepare_short_term_messages(&messages).await;
         let mut effective_memory_context = self.memory_context.clone();
         effective_memory_context.short_term = short_term_preparation.messages.clone();
         effective_memory_context.short_term_summary = short_term_preparation.summary.clone();
-        let memory_instruction = build_memory_instruction(&effective_memory_context);
+        let memory_instruction = combine_instructions(
+            &build_memory_instruction(&effective_memory_context),
+            &mcp_instruction,
+        );
         let input_message_count = short_term_preparation
             .messages
             .iter()
@@ -638,8 +782,11 @@ impl Agent {
                 task_state = normalize_task_state(None);
                 task_state.task = latest_user_message.clone();
                 active_agent = "PLANNING".to_owned();
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_planning_agent(
                     self,
                     &latest_user_message,
@@ -672,8 +819,11 @@ impl Agent {
                     task_state.draft_plan.clone()
                 };
                 active_agent = "EXECUTION".to_owned();
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_execution_agent(
                     self,
                     &latest_user_message,
@@ -692,8 +842,11 @@ impl Agent {
                 task_state.expected_action =
                     "Пользователь вносит правки, Planning Agent обновляет план.".to_owned();
                 active_agent = "PLANNING".to_owned();
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_planning_agent(
                     self,
                     &latest_user_message,
@@ -709,8 +862,11 @@ impl Agent {
                 let dispute_violations = vec![
                     "Пользователь оспорил решение на этапе validation. Доработай решение без возврата в planning.".to_owned(),
                 ];
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_execution_agent(
                     self,
                     &latest_user_message,
@@ -724,8 +880,11 @@ impl Agent {
             }
             ("execution", "approveSolution") | ("validation", _) => {
                 task_state = transition_task_state(task_state, "validation")?;
-                let validation_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let validation_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 on_swarm_status(AgentSwarmStatus {
                     actors: execution_swarm_actors(),
                     active_actor: Some("VALIDATION_GUARD".to_owned()),
@@ -780,9 +939,10 @@ impl Agent {
                         Some("ORCHESTRATOR"),
                         &failure_intro,
                     ));
-                    let stage_memory_instruction = build_memory_instruction_for_task_state(
+                    let stage_memory_instruction = build_stage_instruction(
                         &effective_memory_context,
                         &task_state,
+                        &mcp_instruction,
                     );
                     let corrected = run_execution_agent(
                         self,
@@ -803,8 +963,11 @@ impl Agent {
             }
             ("execution", _) => {
                 active_agent = "EXECUTION".to_owned();
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_execution_agent(
                     self,
                     &latest_user_message,
@@ -818,8 +981,11 @@ impl Agent {
             }
             _ => {
                 active_agent = "PLANNING".to_owned();
-                let stage_memory_instruction =
-                    build_memory_instruction_for_task_state(&effective_memory_context, &task_state);
+                let stage_memory_instruction = build_stage_instruction(
+                    &effective_memory_context,
+                    &task_state,
+                    &mcp_instruction,
+                );
                 run_planning_agent(
                     self,
                     &latest_user_message,
@@ -836,7 +1002,6 @@ impl Agent {
         }
         self.ensure_not_cancelled()?;
 
-        let mut effective_memory_context = effective_memory_context;
         effective_memory_context.task_state = Some(task_state.clone());
         let mut debug = build_memory_debug(&effective_memory_context, input_message_count, "");
         debug.input_message_count = input_message_count;
@@ -865,10 +1030,11 @@ impl Agent {
         debug.orchestrator_agent = active_agent;
         debug.orchestrator_action = action;
         debug.validator_violations = validator_violations;
-        debug.mcp_enabled = self.mcp.everything_enabled;
-        if self.mcp.everything_enabled {
-            debug.mcp_status = "not used in orchestration mode".to_owned();
-        }
+        debug.mcp_enabled = mcp_context.enabled;
+        debug.mcp_status = mcp_context.status;
+        debug.mcp_tool_count = mcp_context.tools.len();
+        debug.mcp_tools = mcp_context.tools;
+        debug.mcp_tool_call = mcp_context.tool_call;
 
         on_memory_started();
         self.ensure_not_cancelled()?;
@@ -2122,6 +2288,17 @@ fn build_memory_instruction_for_task_state(
     build_memory_instruction(&memory)
 }
 
+fn build_stage_instruction(
+    memory: &MemoryContext,
+    task_state: &TaskState,
+    mcp_instruction: &str,
+) -> String {
+    combine_instructions(
+        &build_memory_instruction_for_task_state(memory, task_state),
+        mcp_instruction,
+    )
+}
+
 fn format_task_state(task_state: Option<&TaskState>) -> String {
     let Some(task_state) = task_state else {
         return "Task state machine: No active task state provided.".to_owned();
@@ -2359,6 +2536,90 @@ fn normalize_role(role: &str) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone)]
+struct McpFunctionBinding {
+    function_name: String,
+    tool: McpTool,
+}
+
+fn build_mcp_function_bindings(tools: &[McpTool]) -> Vec<McpFunctionBinding> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let suffix = tool
+                .name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let suffix = suffix.trim_matches('_');
+            let mut function_name = format!("mcp_{index}_{suffix}");
+            function_name.truncate(64);
+            McpFunctionBinding {
+                function_name,
+                tool: tool.clone(),
+            }
+        })
+        .collect()
+}
+
+fn tool_requires_confirmation(tool: &McpTool) -> bool {
+    tool.input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key("confirmed"))
+}
+
+fn has_explicit_write_confirmation(messages: &[ChatMessage]) -> bool {
+    let Some((latest_index, latest)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| normalize_role(&message.role) == "user")
+    else {
+        return false;
+    };
+    let normalized = latest
+        .content
+        .trim()
+        .to_lowercase()
+        .trim_matches(|character: char| character.is_whitespace() || ".,!?;:".contains(character))
+        .to_owned();
+    let affirmative = matches!(
+        normalized.as_str(),
+        "да" | "да подтверждаю"
+            | "подтверждаю"
+            | "согласен"
+            | "согласна"
+            | "создавай"
+            | "выполняй"
+            | "yes"
+            | "confirmed"
+            | "confirm"
+            | "ok"
+            | "okay"
+    ) || normalized.starts_with("да, ")
+        || normalized.starts_with("да ");
+    if !affirmative {
+        return false;
+    }
+
+    messages[..latest_index]
+        .iter()
+        .rev()
+        .find(|message| normalize_role(&message.role) == "assistant")
+        .is_some_and(|message| {
+            let lower = message.content.to_lowercase();
+            lower.contains("подтверд") || lower.contains("confirm")
+        })
+}
+
 fn format_openai_error(status: u16, response_text: &str) -> String {
     if let Ok(error) = serde_json::from_str::<OpenAIErrorResponse>(response_text) {
         return format!("OpenAI API error {status}: {}", error.error.message);
@@ -2409,11 +2670,35 @@ impl OpenAIResponse {
             Some(parts.join("\n"))
         }
     }
+
+    fn function_call(&self) -> Option<OpenAIFunctionCall> {
+        self.output
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|item| item.kind.as_deref() == Some("function_call"))
+            .and_then(|item| {
+                Some(OpenAIFunctionCall {
+                    name: item.name.clone()?,
+                    arguments: item.arguments.clone()?,
+                })
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAIOutputItem {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     content: Option<Vec<OpenAIContentPart>>,
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Debug)]
+struct OpenAIFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2441,6 +2726,67 @@ impl From<OpenAIUsage> for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_write_confirmation_requires_affirmative_reply_after_prompt() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "Создай задачу в Tracker".to_owned(),
+            },
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: "Подтвердите создание задачи. Подтверждаете?".to_owned(),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "да".to_owned(),
+            },
+        ];
+        assert!(has_explicit_write_confirmation(&messages));
+
+        let unconfirmed = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: "Создай задачу в Tracker".to_owned(),
+        }];
+        assert!(!has_explicit_write_confirmation(&unconfirmed));
+    }
+
+    #[test]
+    fn maps_mcp_tools_to_unique_openai_function_names() {
+        let tools = vec![McpTool {
+            server_id: "yandex-tracker".to_owned(),
+            server_name: "Yandex Tracker".to_owned(),
+            name: "create_issue".to_owned(),
+            title: None,
+            description: Some("Create an issue".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"confirmed": {"type": "boolean"}},
+                "required": ["confirmed"]
+            }),
+        }];
+        let bindings = build_mcp_function_bindings(&tools);
+        assert_eq!(bindings[0].function_name, "mcp_0_create_issue");
+        assert!(tool_requires_confirmation(&bindings[0].tool));
+    }
+
+    #[test]
+    fn parses_openai_function_call_output() {
+        let response: OpenAIResponse = serde_json::from_value(json!({
+            "output": [{
+                "type": "function_call",
+                "name": "mcp_0_create_issue",
+                "arguments": "{\"summary\":\"Demo\"}"
+            }]
+        }))
+        .expect("function call response should parse");
+        let call = response
+            .function_call()
+            .expect("function call should exist");
+        assert_eq!(call.name, "mcp_0_create_issue");
+        assert_eq!(call.arguments, "{\"summary\":\"Demo\"}");
+    }
 
     #[test]
     fn parses_clean_memory_router_output() {

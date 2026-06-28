@@ -5,6 +5,7 @@ use agent::{
     cancel_agent_request, clear_agent_request, Agent, AgentReply, AgentRequest, AgentStreamChunk,
     AgentSwarmStatus as AgentSwarmStatusPayload,
 };
+use mcp::{test_mcp_server, McpConnectionTestResult, McpServerConfig};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -92,11 +93,17 @@ fn cancel_agent_message(request_id: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn test_mcp_connection(server: McpServerConfig) -> McpConnectionTestResult {
+    test_mcp_server(server).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             send_agent_message,
-            cancel_agent_message
+            cancel_agent_message,
+            test_mcp_connection
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

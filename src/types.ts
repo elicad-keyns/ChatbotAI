@@ -81,10 +81,25 @@ export interface OrchestrationSettings {
 }
 
 export interface McpSettings {
-  everythingEnabled: boolean;
+  servers: McpServerConfig[];
+}
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: "stdio" | "streamableHttp";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers: Record<string, string>;
 }
 
 export interface McpTool {
+  serverId: string;
+  serverName: string;
   name: string;
   title?: string;
   description?: string;
@@ -92,10 +107,20 @@ export interface McpTool {
 }
 
 export interface McpToolCallInfo {
+  serverId: string;
+  serverName: string;
   toolName: string;
   arguments: string;
   result: string;
   isError: boolean;
+}
+
+export interface McpConnectionTestResult {
+  serverId: string;
+  serverName: string;
+  connected: boolean;
+  status: string;
+  tools: McpTool[];
 }
 
 export interface MemoryContext {

@@ -88,3 +88,116 @@ npm run build
 cd src-tauri
 cargo check
 ```
+
+## День 16. Подключение MCP
+
+В приложении реализован MCP-клиент для локальных `stdio`-серверов и удалённых
+`Streamable HTTP`-серверов. Клиент:
+
+1. запускает процесс из настроек (`command`, `args`, `env`, `cwd`);
+2. отправляет JSON-RPC запрос `initialize`;
+3. отправляет уведомление `notifications/initialized`;
+4. вызывает `tools/list` с поддержкой пагинации;
+5. показывает полученные инструменты в настройках и передает их агенту;
+6. вызывает `tools/call`, если пользователь отправляет прямую MCP-команду.
+
+Для Streamable HTTP клиент отправляет JSON-RPC через POST, принимает JSON или SSE,
+сохраняет `Mcp-Session-Id`, передаёт `MCP-Protocol-Version` и поддерживает
+пользовательские HTTP-заголовки (`Authorization`, API keys и другие).
+
+Локальный тестовый сервер `@modelcontextprotocol/server-everything` установлен как
+dev-зависимость и уже добавлен в настройки по умолчанию.
+
+### Проверка в приложении
+
+```bash
+npm install
+npm run tauri:dev
+```
+
+Откройте `Настройки` → `MCP-серверы` и нажмите
+`Проверить и получить tools`. При успешной проверке интерфейс покажет статус
+соединения и имена инструментов, возвращенных `tools/list`.
+
+Кнопки `+ Remote` и `+ stdio` создают конфигурации соответствующего транспорта.
+Для каждого stdio-сервера
+можно отдельно задать название, команду, аргументы (по одному на строку), рабочую
+папку и переменные окружения. Для remote-сервера задаются endpoint URL и
+HTTP-заголовки. Включенных серверов может быть несколько.
+
+Публичный пример удалённого сервера:
+
+```text
+Name: Cloudflare Docs
+Transport: Streamable HTTP
+URL: https://docs.mcp.cloudflare.com/mcp
+```
+
+Для Figma доступен preset `+ Figma` с URL `https://mcp.figma.com/mcp`. Figma Remote
+требует интерактивный OAuth и на текущем этапе принимает только MCP-клиенты из
+каталога Figma. Generic HTTP-транспорт реализован, но для полноценной авторизации
+собственного приложения потребуется зарегистрировать его у Figma.
+
+Прямой вызов инструмента из чата:
+
+```text
+/mcp <serverId> <toolName> {"argument":"value"}
+```
+
+Для инструмента с уникальным именем доступна короткая форма:
+
+```text
+/mcp <toolName> {"argument":"value"}
+```
+
+Пример для сервера Everything:
+
+```text
+/mcp everything echo {"message":"hello"}
+```
+
+### Автоматическая проверка реального соединения
+
+После `npm install` можно запустить интеграционный тест. Он поднимает локальный
+Everything MCP, устанавливает соединение и печатает список инструментов:
+
+```bash
+cd src-tauri
+cargo test mcp::tests::everything_server_connects_and_lists_tools -- --ignored --nocapture
+cargo test mcp::tests::remote_http_server_connects_and_lists_tools -- --ignored --nocapture
+```
+
+Основная реализация находится в `src-tauri/src/mcp.rs`, Tauri-команда проверки —
+в `src-tauri/src/lib.rs`, интерфейс нескольких подключений — в `src/App.tsx`.
+
+## День 17. Yandex Tracker MCP
+
+Собственный MCP-сервер создан как независимый Python-проект в соседней папке:
+
+```text
+../YandexTrackerMCP
+```
+
+Он может быть вынесен в отдельный репозиторий и развёрнут на сервере через Docker.
+Сервер регистрирует инструменты `create_issue`, `get_issue`, `update_issue`,
+`list_issue_transitions` и `cancel_issue`, описывает входные параметры через JSON Schema
+и возвращает структурированный результат с ключом и ссылкой задачи.
+
+В настройках приложения кнопка `+ Tracker` добавляет готовую remote-конфигурацию.
+После деплоя замените локальный URL на `https://your-host/mcp`, укажите заголовок
+`Authorization: Bearer <MCP_API_KEY>`, включите сервер и выполните проверку tools.
+
+Агент автоматически выбирает подходящий MCP-инструмент через function calling. Для
+write-инструментов он сначала запрашивает подтверждение, а после ответа пользователя
+`да` восстанавливает параметры из истории, выполняет `tools/call` и сообщает об успехе
+только при наличии фактического результата с ключом и URL задачи.
+
+Прямой проверочный вызов:
+
+```text
+/mcp yandex-tracker create_issue {"summary":"Day 17 MCP demo","queue":"TEST","confirmed":true,"unique":"day17-tracker-demo"}
+```
+
+Инструкция OAuth/IAM, Docker и production-секретов находится в
+`../YandexTrackerMCP/README.md`. Отдельные задачи в Tracker удалить нельзя, поэтому
+инструмент `cancel_issue` выполняет подтверждённый workflow-переход отмены или закрытия.
